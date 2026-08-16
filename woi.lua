@@ -51,7 +51,7 @@ end)
 
 -- Detect KRNL and set up queue_on_teleport
 local isKRNL = typeof(queue_on_teleport) == "function"
-local SCRIPT_URL = "https://raw.githubusercontent.com/ShigeSC/GUi/refs/heads/main/woi.lua"
+local SCRIPT_URL = "https://raw.githubusercontent.com/yupie1558-beep/gag2/refs/heads/main/gag2loader.lua"
 
 -- Function to queue this script for execution after teleport
 local function setupAutoRejoinQueue()
@@ -163,7 +163,7 @@ local Config = {
     Logo = "rbxassetid://90541504618217",
     LogoColor = Color3.fromRGB(255, 255, 255),
     Title = "AUTO BUY PET",
-    Version = "V1.9",
+    Version = "V2",
     SubTitle = "by ScoopHub",
     HubNameColor = Color3.fromRGB(242, 92, 101),
     SubTitleColor = Color3.fromRGB(166, 174, 187),
@@ -546,14 +546,14 @@ local function sendWebhook(title, description, color, fields, thumbnailUrl, dest
         description = description,
         color = color or 15158203,
         -- Discord renders the timestamp below this footer as "Today at 3:18 AM".
-        footer = { text = "AUTO BUY PET V1.9  •  discord.gg/WxgqUa9Qz" },
+        footer = { text = "AUTO BUY PET V2  •  discord.gg/WxgqUa9Qz" },
         timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
     }
     if fields then embed.fields = fields end
     if thumbnailUrl then embed.thumbnail = { url = thumbnailUrl } end
 
     local body = HttpService:JSONEncode({
-        username = "ScoopHub | AUTO BUY PET V1.9",
+        username = "ScoopHub | AUTO BUY PET V2",
         embeds = { embed },
     })
 
@@ -2941,9 +2941,10 @@ do
         C.WriteOwn()
     end
 
-    function C.IsBlocked(jobId)
+    function C.IsBlocked(jobId, allowVisited)
         jobId = tostring(jobId or "")
-        if jobId == "" or jobId == game.JobId or C.VisitedJobIds[jobId] then return true end
+        if jobId == "" or jobId == game.JobId then return true end
+        if not allowVisited and C.VisitedJobIds[jobId] then return true end
         local failedAt = C.FailedJobIds[jobId]
         if failedAt then
             if tick() - failedAt < C.FailedTTL then return true end
@@ -2952,9 +2953,9 @@ do
         return false
     end
 
-    function C.TryReserve(jobId)
+    function C.TryReserve(jobId, allowVisited)
         jobId = tostring(jobId or "")
-        if C.IsBlocked(jobId) then return false end
+        if C.IsBlocked(jobId, allowVisited) then return false end
         if not C.SharedSupported then
             C.OwnReservedJobId = jobId
             return true
@@ -3809,7 +3810,7 @@ TestWebhookButton.Activated:Connect(function()
         Notify("Webhook", "Enable Webhook and add a URL first.", 2)
         return
     end
-    local sent, reason = sendWebhook("Webhook Connected", "Test alert from AUTO BUY PET V1.9.", 5763719)
+    local sent, reason = sendWebhook("Webhook Connected", "Test alert from AUTO BUY PET V2.", 5763719)
     if sent then
         Notify("Webhook", "Test alert delivered.", 2)
     else
@@ -3823,7 +3824,7 @@ TestSellWebhookButton.Activated:Connect(function()
         Notify("Sell Webhook", "Enable Sell Webhook and add a URL first.", 2)
         return
     end
-    local sent, reason = sendWebhook("Sell Webhook Connected", "Test sell-summary alert from AUTO BUY PET V1.9.", 15105570, nil, nil, sellWebhookUrl, true)
+    local sent, reason = sendWebhook("Sell Webhook Connected", "Test sell-summary alert from AUTO BUY PET V2.", 15105570, nil, nil, sellWebhookUrl, true)
     Notify("Sell Webhook", sent and "Test alert delivered." or ("Test failed: " .. tostring(reason or "request unavailable")), sent and 2 or 4)
     updateWebhookUI()
 end)
@@ -4225,60 +4226,140 @@ function startWildPetLabels()
 end
 
 -- =========================================================
--- PET PROTECT LOGIC + CENTRALIZED AUTO SERVER HOP
+-- PET PROTECT LOGIC + CENTRALIZED AUTO SERVER HOP V4
 -- =========================================================
 Theme.FindLowPopulationServer = function()
-    local candidates = {}
+    local freshLow = {}
+    local visitedLow = {}
+    local freshAny = {}
+    local visitedAny = {}
     local cursor = nil
     local claimed = Theme.ServerHopClaims.GetClaimed()
+    local successfulPages = 0
+    local lastLookupError = nil
 
-    -- Check up to three pages. Claimed, recently failed, visited, and current
-    -- JobIds are excluded before a candidate is returned.
-    for _ = 1, 3 do
+    -- Roblox's server-list endpoint can fail temporarily when many accounts query
+    -- it together. Retry each page instead of treating one HTTP/JSON failure as
+    -- proof that no servers exist. Scan several pages so simultaneous accounts
+    -- have a larger pool of unique JobIds to spread across.
+    for pageNumber = 1, 8 do
+        local page = nil
         local url = "https://games.roblox.com/v1/games/" .. game.PlaceId
             .. "/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true"
         if cursor then
             url = url .. "&cursor=" .. HttpService:UrlEncode(cursor)
         end
 
-        local requestOk, responseBody = pcall(function()
-            return game:HttpGet(url)
-        end)
-        if not requestOk or type(responseBody) ~= "string" then
-            break
-        end
+        for requestAttempt = 1, 3 do
+            local requestOk, responseBody = pcall(function()
+                return game:HttpGet(url)
+            end)
 
-        local decodeOk, page = pcall(function()
-            return HttpService:JSONDecode(responseBody)
-        end)
-        if not decodeOk or type(page) ~= "table" then
-            break
-        end
+            -- Some executors intermittently reject game:HttpGet for the Roblox
+            -- server endpoint while their request API still works. Use it as a
+            -- second transport before declaring the lookup unavailable.
+            if not requestOk or type(responseBody) ~= "string" then
+                local requestFn = (syn and syn.request)
+                    or (http and http.request)
+                    or http_request
+                    or request
+                if type(requestFn) == "function" then
+                    local fallbackOk, fallbackResponse = pcall(function()
+                        return requestFn({ Url = url, Method = "GET" })
+                    end)
+                    local fallbackStatus = fallbackOk and type(fallbackResponse) == "table"
+                        and tonumber(fallbackResponse.StatusCode or fallbackResponse.Status or 200) or 0
+                    local fallbackBody = fallbackOk and type(fallbackResponse) == "table"
+                        and (fallbackResponse.Body or fallbackResponse.body) or nil
+                    if fallbackOk and fallbackStatus < 300 and type(fallbackBody) == "string" then
+                        requestOk = true
+                        responseBody = fallbackBody
+                    end
+                end
+            end
 
-        for _, server in ipairs(page.data or {}) do
-            local players = tonumber(server.playing) or 0
-            local jobId = tostring(server.id or "")
-            if jobId ~= ""
-                and players >= 1 and players <= 6
-                and not claimed[jobId]
-                and not Theme.ServerHopClaims.IsBlocked(jobId) then
-                table.insert(candidates, server)
+            if requestOk and type(responseBody) == "string" then
+                local decodeOk, decoded = pcall(function()
+                    return HttpService:JSONDecode(responseBody)
+                end)
+                if decodeOk and type(decoded) == "table" then
+                    page = decoded
+                    break
+                end
+                lastLookupError = "Roblox returned an unreadable server list"
+            else
+                lastLookupError = "Roblox server-list request failed"
+            end
+            if requestAttempt < 3 then
+                task.wait(0.25 * requestAttempt)
             end
         end
 
-        if #candidates > 0 or not page.nextPageCursor then
+        if not page then
+            break
+        end
+
+        successfulPages = successfulPages + 1
+        for _, server in ipairs(page.data or {}) do
+            local players = tonumber(server.playing) or 0
+            local maxPlayers = tonumber(server.maxPlayers) or math.huge
+            local jobId = tostring(server.id or "")
+            if jobId ~= ""
+                and players >= 1
+                and players < maxPlayers
+                and not claimed[jobId]
+                and not Theme.ServerHopClaims.IsBlocked(jobId, true) then
+                local wasVisited = Theme.ServerHopClaims.VisitedJobIds[jobId] == true
+                if players <= 6 then
+                    table.insert(wasVisited and visitedLow or freshLow, server)
+                else
+                    table.insert(wasVisited and visitedAny or freshAny, server)
+                end
+            end
+        end
+
+        -- Once we have a healthy fresh low-population pool, there is no reason
+        -- to keep hammering the endpoint. Otherwise keep paging for fallbacks.
+        if #freshLow >= 12 or not page.nextPageCursor then
             break
         end
         cursor = page.nextPageCursor
+    end
+
+    Theme.ServerHopClaims.LastLookupError = successfulPages == 0 and lastLookupError or nil
+
+    -- Population is a preference, not a hard requirement. Fresh 1-6 servers are
+    -- best; if those are exhausted, reuse an old 1-6 server, then use any fresh
+    -- non-full server, and only then reuse an older non-full server. Claims, the
+    -- current JobId, and recently failed JobIds are still always excluded.
+    local candidates = freshLow
+    local allowVisited = false
+    local populationLabel = "1-6 player"
+    if #candidates == 0 then
+        candidates = visitedLow
+        allowVisited = true
+        populationLabel = "1-6 player (previously visited)"
+    end
+    if #candidates == 0 then
+        candidates = freshAny
+        allowVisited = false
+        populationLabel = "non-full"
+    end
+    if #candidates == 0 then
+        candidates = visitedAny
+        allowVisited = true
+        populationLabel = "non-full (previously visited)"
     end
 
     if #candidates == 0 then
         return nil
     end
 
-    -- Spread accounts across the candidate list before the reservation handshake.
     local index = Theme.ServerHopClaims.NextSelectionIndex(#candidates)
-    return candidates[index]
+    local chosen = candidates[index]
+    chosen._ScoopHubAllowVisited = allowVisited
+    chosen._ScoopHubPopulationLabel = populationLabel
+    return chosen
 end
 
 function waitForPendingPetDelivery()
@@ -4350,30 +4431,39 @@ do
 
         local targetJobId = nil
         local routeName = "random"
+        local allowVisited = false
+        local populationLabel = "1-6 player"
         for _ = 1, 10 do
             targetJobId = Theme.ServerHopClaims.NextCustomJobId()
             routeName = targetJobId and "custom" or "random"
+            allowVisited = false
+            populationLabel = "saved Job ID"
             if not targetJobId then
                 local server = Theme.FindLowPopulationServer()
                 targetJobId = server and tostring(server.id or "") or nil
+                allowVisited = server and server._ScoopHubAllowVisited == true or false
+                populationLabel = server and tostring(server._ScoopHubPopulationLabel or "server") or "server"
             end
             if not targetJobId then break end
-            if Theme.ServerHopClaims.TryReserve(targetJobId) then break end
+            if Theme.ServerHopClaims.TryReserve(targetJobId, allowVisited) then break end
             targetJobId = nil
             task.wait(0.08)
         end
 
         if not targetJobId then
-            H.ScheduleRetry("No unclaimed 1-6 player server is available yet.")
+            if Theme.ServerHopClaims.LastLookupError then
+                H.ScheduleRetry(Theme.ServerHopClaims.LastLookupError .. "; trying the server list again.")
+            else
+                H.ScheduleRetry("No unique non-full server is free right now.")
+            end
             return
         end
 
         H.TargetJobId = targetJobId
         H.StartCounted = false
-        Theme.ServerHopClaims.MarkVisited(targetJobId)
         Notify("Server Hop", routeName == "custom"
             and "Reserved a unique saved Job ID. Hopping..."
-            or "Reserved a unique 1-6 player server. Hopping...", 2)
+            or ("Reserved a unique " .. populationLabel .. " server. Hopping..."), 2)
 
         if isKRNL and not H.QueuePrepared then
             enableKRNLQueue()
@@ -4438,6 +4528,7 @@ do
             print("[AutoBuyPet] Teleport started - saving state...")
             if serverHopInProgress and H.TargetJobId and not H.StartCounted then
                 H.StartCounted = true
+                Theme.ServerHopClaims.MarkVisited(H.TargetJobId)
                 serverHops = serverHops + 1
                 if ServerHopsLabel then ServerHopsLabel.Text = formatWebhookNumber(serverHops) end
                 addActivity("Server hop " .. tostring(serverHops) .. " started")
@@ -5356,4 +5447,4 @@ end
 print("[AutoBuyPet] Loaded: " .. tostring(isKRNL) .. " | SERVER HOPPING: " .. tostring(autoRejoin))
 addActivity("Script loaded")
 Notify("Loaded", "Settings restored: " .. tostring(isKRNL), 3)
---
+-- HEHE
