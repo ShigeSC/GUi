@@ -106,6 +106,26 @@ _G.ScoopHubAutoBuyPetTeleportConnection = LocalPlayer.OnTeleport:Connect(functio
     end
 end)
 
+-- Keep exactly one TeleportInitFailed listener too. This gives the controller
+-- the actual Roblox failure reason (for example GameFull / Error 772), which
+-- LocalPlayer.OnTeleport alone does not provide.
+if _G.ScoopHubAutoBuyPetTeleportInitFailedConnection then
+    pcall(function()
+        _G.ScoopHubAutoBuyPetTeleportInitFailedConnection:Disconnect()
+    end)
+end
+
+_G.ScoopHubTeleportInitFailedHandler = nil
+_G.ScoopHubTeleport772Handler = nil
+_G.ScoopHubAutoBuyPetTeleportInitFailedConnection = TeleportService.TeleportInitFailed:Connect(
+    function(player, teleportResult, errorMessage, placeId, teleportOptions)
+        local handler = _G.ScoopHubTeleportInitFailedHandler
+        if type(handler) == "function" then
+            handler(player, teleportResult, errorMessage, placeId, teleportOptions)
+        end
+    end
+)
+
 -- KRNL queue setup. This is intentionally called only immediately before
 -- the script itself starts an automatic rejoin.
 local function enableKRNLQueue()
@@ -163,7 +183,7 @@ local Config = {
     Logo = "rbxassetid://90541504618217",
     LogoColor = Color3.fromRGB(255, 255, 255),
     Title = "AUTO BUY PET",
-    Version = "V2",
+    Version = "V2.1",
     SubTitle = "by ScoopHub",
     HubNameColor = Color3.fromRGB(242, 92, 101),
     SubTitleColor = Color3.fromRGB(166, 174, 187),
@@ -546,14 +566,14 @@ local function sendWebhook(title, description, color, fields, thumbnailUrl, dest
         description = description,
         color = color or 15158203,
         -- Discord renders the timestamp below this footer as "Today at 3:18 AM".
-        footer = { text = "AUTO BUY PET V2  •  discord.gg/WxgqUa9Qz" },
+        footer = { text = "AUTO BUY PET V2.1  •  discord.gg/WxgqUa9Qz" },
         timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
     }
     if fields then embed.fields = fields end
     if thumbnailUrl then embed.thumbnail = { url = thumbnailUrl } end
 
     local body = HttpService:JSONEncode({
-        username = "ScoopHub | AUTO BUY PET V2",
+        username = "ScoopHub | AUTO BUY PET V2.1",
         embeds = { embed },
     })
 
@@ -605,6 +625,17 @@ end
 pcall(function()
     GuiService.ErrorMessageChanged:Connect(function(message)
         local lowerMessage = string.lower(tostring(message or ""))
+
+        -- Some clients surface Error 772 through the Roblox error UI before or
+        -- alongside TeleportInitFailed. Forward it to the same hop controller so
+        -- it can immediately choose another Job ID from the already-fetched batch.
+        if lowerMessage:find("error code: 772", 1, true) or lowerMessage:find("server is full", 1, true) then
+            local fullHandler = _G.ScoopHubTeleport772Handler
+            if type(fullHandler) == "function" then
+                fullHandler(message)
+            end
+        end
+
         if webhookDisconnectAlerts and (lowerMessage:find("error code: 279", 1, true) or lowerMessage:find("failed to connect", 1, true))
             and tick() - lastDisconnectWebhookAt > 20 then
             lastDisconnectWebhookAt = tick()
@@ -2936,7 +2967,7 @@ do
     end
 
     function C.FetchServerPage(url)
-        -- V7: exactly ONE Roblox server-list request per hop attempt.
+        -- V8: exactly ONE Roblox server-list request per fresh hop attempt.
         -- No pagination loop, no executor HTTP fallback, and no rapid retry
         -- inside this function. If it fails, the centralized hop controller
         -- waits before beginning a brand-new attempt.
@@ -3181,7 +3212,7 @@ do
 
     C.WriteOwn()
     C.DebugLines = {}
-    C.Debug(string.format("V7 single-request start user=%s userId=%s placeId=%s jobId=%s sharedClaims=%s",
+    C.Debug(string.format("V8 single-request + 772 same-batch failover start user=%s userId=%s placeId=%s jobId=%s sharedClaims=%s",
         tostring(LocalPlayer.Name), tostring(LocalPlayer.UserId), tostring(game.PlaceId), tostring(game.JobId), tostring(C.SharedSupported)))
     _G.ScoopHubServerClaimHeartbeatToken = (_G.ScoopHubServerClaimHeartbeatToken or 0) + 1
     C.HeartbeatToken = _G.ScoopHubServerClaimHeartbeatToken
@@ -3953,7 +3984,7 @@ TestWebhookButton.Activated:Connect(function()
         Notify("Webhook", "Enable Webhook and add a URL first.", 2)
         return
     end
-    local sent, reason = sendWebhook("Webhook Connected", "Test alert from AUTO BUY PET V2.", 5763719)
+    local sent, reason = sendWebhook("Webhook Connected", "Test alert from AUTO BUY PET V2.1.", 5763719)
     if sent then
         Notify("Webhook", "Test alert delivered.", 2)
     else
@@ -3967,7 +3998,7 @@ TestSellWebhookButton.Activated:Connect(function()
         Notify("Sell Webhook", "Enable Sell Webhook and add a URL first.", 2)
         return
     end
-    local sent, reason = sendWebhook("Sell Webhook Connected", "Test sell-summary alert from AUTO BUY PET V2.", 15105570, nil, nil, sellWebhookUrl, true)
+    local sent, reason = sendWebhook("Sell Webhook Connected", "Test sell-summary alert from AUTO BUY PET V2.1.", 15105570, nil, nil, sellWebhookUrl, true)
     Notify("Sell Webhook", sent and "Test alert delivered." or ("Test failed: " .. tostring(reason or "request unavailable")), sent and 2 or 4)
     updateWebhookUI()
 end)
@@ -4369,7 +4400,7 @@ function startWildPetLabels()
 end
 
 -- =========================================================
--- PET PROTECT LOGIC + CENTRALIZED AUTO SERVER HOP V7
+-- PET PROTECT LOGIC + CENTRALIZED AUTO SERVER HOP V8
 -- =========================================================
 Theme.GetServerHopCandidates = function()
     local freshLow = {}
@@ -4378,7 +4409,7 @@ Theme.GetServerHopCandidates = function()
     local visitedAny = {}
     local claimed = Theme.ServerHopClaims.GetClaimed()
 
-    Theme.ServerHopClaims.Debug("=== V7 ONE-REQUEST SERVER SEARCH START ===")
+    Theme.ServerHopClaims.Debug("=== V8 ONE-REQUEST + SAME-BATCH FAILOVER SEARCH START ===")
 
     -- One request, one page, up to 100 servers.  This mirrors the request
     -- pattern confirmed by the working comparison script.
@@ -4507,13 +4538,26 @@ do
     H.TargetJobId = nil
     H.StartCounted = false
     H.QueuePrepared = false
+    H.BatchCandidates = nil
+    H.BatchIndex = 0
+    H.CurrentRoute = nil
+    H.CurrentPopulationLabel = "server"
+    H.IgnoreTeleportStateFailedUntil = 0
+    H.LastFullFailureAt = 0
 
     function H.RetryDelay()
-        -- A failed hop creates a new attempt, and therefore one new server-list
-        -- request. Keep those attempts spaced out instead of creating a request storm.
+        -- A fresh retry means one fresh server-list request. Keep those attempts
+        -- spaced out; Error 772 does NOT use this path while batch candidates remain.
         local delays = { 4.0, 6.0, 8.0, 10.0, 12.0 }
         local base = delays[math.min(H.RetryCount, #delays)] or 12.0
         return base + (((LocalPlayer.UserId + H.RetryCount * 11) % 7) * 0.15)
+    end
+
+    function H.ResetBatch()
+        H.BatchCandidates = nil
+        H.BatchIndex = 0
+        H.CurrentRoute = nil
+        H.CurrentPopulationLabel = "server"
     end
 
     function H.Cancel(showMessage)
@@ -4525,6 +4569,8 @@ do
         H.TargetJobId = nil
         H.StartCounted = false
         H.QueuePrepared = false
+        H.IgnoreTeleportStateFailedUntil = 0
+        H.ResetBatch()
         Theme.ServerHopClaims.Clear()
         if showMessage then Notify("Server Hop", tostring(showMessage), 2) end
     end
@@ -4534,6 +4580,10 @@ do
         H.RetryCount = H.RetryCount + 1
         local delaySeconds = tonumber(delayOverride) or H.RetryDelay()
         local token = H.CycleToken
+
+        -- A scheduled retry is a brand-new attempt, so discard the old 100-server
+        -- page. Same-page failover is handled separately by TryNextBatchCandidate().
+        H.ResetBatch()
 
         if message and message ~= "" then
             Notify(
@@ -4550,17 +4600,188 @@ do
         end)
     end
 
-    function H.Fail(reason)
+    function H.ReserveNextBatchCandidate()
+        if type(H.BatchCandidates) ~= "table" then return nil, nil end
+
+        while H.BatchIndex < #H.BatchCandidates do
+            H.BatchIndex = H.BatchIndex + 1
+            local server = H.BatchCandidates[H.BatchIndex]
+            local jobId = tostring(server and server.id or "")
+            local allowVisited = server and server._ScoopHubAllowVisited == true
+
+            if jobId ~= "" and Theme.ServerHopClaims.TryReserve(jobId, allowVisited) then
+                return jobId, tostring(server._ScoopHubPopulationLabel or "server")
+            end
+            task.wait(0.03)
+        end
+
+        return nil, nil
+    end
+
+    function H.FinalReservationStillOurs(targetJobId)
+        if not Theme.ServerHopClaims.SharedSupported then return true end
+
+        local stillOurs = false
+        local blockedByCurrent = false
+        local winnerUserId = LocalPlayer.UserId
+
+        for _, claim in ipairs(Theme.ServerHopClaims.Read()) do
+            local uid = tonumber(claim.userId)
+            if uid == LocalPlayer.UserId and tostring(claim.reservedJobId or "") == targetJobId then
+                stillOurs = true
+            elseif uid and uid ~= LocalPlayer.UserId then
+                if tostring(claim.currentJobId or "") == targetJobId then
+                    blockedByCurrent = true
+                elseif tostring(claim.reservedJobId or "") == targetJobId then
+                    winnerUserId = math.min(winnerUserId, uid)
+                end
+            end
+        end
+
+        return stillOurs and not blockedByCurrent and winnerUserId == LocalPlayer.UserId
+    end
+
+    function H.LaunchReservedTarget(routeName, populationLabel, messageOverride)
+        if not serverHopInProgress or not H.TargetJobId then return false end
+
+        local token = H.CycleToken
+        local targetJobId = H.TargetJobId
+        H.CurrentRoute = routeName or H.CurrentRoute or "random"
+        H.CurrentPopulationLabel = populationLabel or H.CurrentPopulationLabel or "server"
+        H.StartCounted = false
+
+        Notify(
+            "Server Hop",
+            messageOverride
+                or (H.CurrentRoute == "custom"
+                    and "Reserved a unique saved Job ID. Hopping..."
+                    or ("Reserved a unique " .. H.CurrentPopulationLabel .. " server. Hopping...")),
+            2
+        )
+
+        if isKRNL and not H.QueuePrepared then
+            enableKRNLQueue()
+            H.QueuePrepared = true
+        end
+
+        saveSettings()
+        task.wait(0.35)
+
+        if not serverHopInProgress or H.CycleToken ~= token or H.TargetJobId ~= targetJobId then
+            return false
+        end
+
+        -- Final shared-filesystem ownership check immediately before teleport.
+        if not H.FinalReservationStillOurs(targetJobId) then
+            H.TargetJobId = nil
+            Theme.ServerHopClaims.Clear()
+
+            if H.CurrentRoute == "random" then
+                local nextJobId, nextLabel = H.ReserveNextBatchCandidate()
+                if nextJobId then
+                    H.TargetJobId = nextJobId
+                    task.spawn(function()
+                        H.LaunchReservedTarget(
+                            "random",
+                            nextLabel,
+                            "Another account won that Job ID. Trying another server from the same list..."
+                        )
+                    end)
+                    return false
+                end
+            end
+
+            H.ScheduleRetry("Another account won that Job ID reservation.", 4.0)
+            return false
+        end
+
+        Theme.ServerHopClaims.Debug(string.format(
+            "TELEPORT TRY batchIndex=%s/%s jobId=%s route=%s",
+            tostring(H.BatchIndex),
+            type(H.BatchCandidates) == "table" and tostring(#H.BatchCandidates) or "custom",
+            tostring(targetJobId),
+            tostring(H.CurrentRoute)
+        ))
+
+        local success, err = pcall(function()
+            TeleportService:TeleportToPlaceInstance(game.PlaceId, targetJobId, LocalPlayer)
+        end)
+
+        if not success then
+            H.HandleFailure(err, H.CurrentRoute == "random", false)
+            return false
+        end
+
+        return true
+    end
+
+    function H.TryNextBatchCandidate(reason)
+        if not serverHopInProgress or H.CurrentRoute ~= "random" then return false end
+
+        local nextJobId, nextLabel = H.ReserveNextBatchCandidate()
+        if not nextJobId then
+            return false
+        end
+
+        H.TargetJobId = nextJobId
+        H.StartCounted = false
+
+        Theme.ServerHopClaims.Debug(string.format(
+            "SAME_BATCH FAILOVER nextJobId=%s batchIndex=%d/%d reason=%s",
+            tostring(nextJobId),
+            H.BatchIndex,
+            type(H.BatchCandidates) == "table" and #H.BatchCandidates or 0,
+            tostring(reason or "unknown")
+        ))
+
+        task.spawn(function()
+            H.LaunchReservedTarget(
+                "random",
+                nextLabel,
+                "Previous server was unavailable. Trying another Job ID from the same 100-server list..."
+            )
+        end)
+        return true
+    end
+
+    function H.HandleFailure(reason, preferSameBatch, isServerFull)
         if not serverHopInProgress or not H.TargetJobId then return end
 
         local failedJobId = H.TargetJobId
-        Theme.ServerHopClaims.MarkFailed(failedJobId)
         H.TargetJobId = nil
         H.StartCounted = false
+        H.IgnoreTeleportStateFailedUntil = tick() + 1.75
+        Theme.ServerHopClaims.MarkFailed(failedJobId)
         Theme.ServerHopClaims.Clear()
 
         print("[AutoBuyPet] Teleport failed for " .. tostring(failedJobId) .. ": " .. tostring(reason or "unknown"))
-        H.ScheduleRetry("Teleport failed; choosing a different server.")
+        Theme.ServerHopClaims.Debug(string.format(
+            "TELEPORT FAILED jobId=%s serverFull=%s reason=%s",
+            tostring(failedJobId), tostring(isServerFull == true), tostring(reason or "unknown")
+        ))
+
+        local token = H.CycleToken
+        task.delay(isServerFull and 0.45 or 0.60, function()
+            if not serverHopInProgress or H.CycleToken ~= token or H.TargetJobId then return end
+
+            if preferSameBatch and H.CurrentRoute == "random" and H.TryNextBatchCandidate(reason) then
+                return
+            end
+
+            if isServerFull then
+                H.ScheduleRetry("All remaining servers in this 100-server list were unavailable; fetching one fresh list.", 4.0)
+            else
+                H.ScheduleRetry("Teleport failed; choosing a different server.")
+            end
+        end)
+    end
+
+    function H.IsServerFullFailure(teleportResult, errorMessage)
+        local text = string.lower(tostring(teleportResult or "") .. " " .. tostring(errorMessage or ""))
+        return text:find("772", 1, true) ~= nil
+            or text:find("server is full", 1, true) ~= nil
+            or text:find("gamefull", 1, true) ~= nil
+            or text:find("game full", 1, true) ~= nil
     end
 
     function H.Perform()
@@ -4570,6 +4791,8 @@ do
             H.Cancel("Waiting for " .. (pendingPetDeliveryName ~= "" and pendingPetDeliveryName or "the bought pet") .. " to arrive in your Backpack.")
             return
         end
+
+        H.ResetBatch()
 
         local targetJobId = nil
         local routeName = "random"
@@ -4592,8 +4815,8 @@ do
         end
 
         -- Random route: exactly ONE server-list request for this Perform() call.
-        -- If a reservation collision happens, try the next candidate from the SAME
-        -- response instead of fetching another page/request.
+        -- Keep the ENTIRE filtered candidate list in memory so Error 772 can move
+        -- to the next Job ID without another HTTP request.
         if not targetJobId then
             local candidates = Theme.GetServerHopCandidates()
 
@@ -4607,17 +4830,10 @@ do
                 return
             end
 
-            for _, server in ipairs(candidates) do
-                local jobId = tostring(server.id or "")
-                local allowVisited = server._ScoopHubAllowVisited == true
-                if jobId ~= "" and Theme.ServerHopClaims.TryReserve(jobId, allowVisited) then
-                    targetJobId = jobId
-                    routeName = "random"
-                    populationLabel = tostring(server._ScoopHubPopulationLabel or "server")
-                    break
-                end
-                task.wait(0.03)
-            end
+            H.BatchCandidates = candidates
+            H.BatchIndex = 0
+            targetJobId, populationLabel = H.ReserveNextBatchCandidate()
+            routeName = "random"
         end
 
         if not targetJobId then
@@ -4626,60 +4842,10 @@ do
         end
 
         H.TargetJobId = targetJobId
+        H.CurrentRoute = routeName
+        H.CurrentPopulationLabel = populationLabel
         H.StartCounted = false
-
-        Notify(
-            "Server Hop",
-            routeName == "custom"
-                and "Reserved a unique saved Job ID. Hopping..."
-                or ("Reserved a unique " .. populationLabel .. " server. Hopping..."),
-            2
-        )
-
-        if isKRNL and not H.QueuePrepared then
-            enableKRNLQueue()
-            H.QueuePrepared = true
-        end
-
-        saveSettings()
-        task.wait(0.35)
-
-        -- Final shared-filesystem ownership check immediately before teleport.
-        if Theme.ServerHopClaims.SharedSupported then
-            local stillOurs = false
-            local blockedByCurrent = false
-            local winnerUserId = LocalPlayer.UserId
-
-            for _, claim in ipairs(Theme.ServerHopClaims.Read()) do
-                local uid = tonumber(claim.userId)
-                if uid == LocalPlayer.UserId and tostring(claim.reservedJobId or "") == targetJobId then
-                    stillOurs = true
-                elseif uid and uid ~= LocalPlayer.UserId then
-                    if tostring(claim.currentJobId or "") == targetJobId then
-                        blockedByCurrent = true
-                    elseif tostring(claim.reservedJobId or "") == targetJobId then
-                        winnerUserId = math.min(winnerUserId, uid)
-                    end
-                end
-            end
-
-            if not stillOurs or blockedByCurrent or winnerUserId ~= LocalPlayer.UserId then
-                H.TargetJobId = nil
-                Theme.ServerHopClaims.Clear()
-                -- Important: this starts a NEW attempt later. We do not make another
-                -- server-list request immediately inside the current attempt.
-                H.ScheduleRetry("Another account won that Job ID reservation.", 4.0)
-                return
-            end
-        end
-
-        local success, err = pcall(function()
-            TeleportService:TeleportToPlaceInstance(game.PlaceId, targetJobId, LocalPlayer)
-        end)
-
-        if not success then
-            H.Fail(err)
-        end
+        H.LaunchReservedTarget(routeName, populationLabel)
     end
 
     function H.Begin(source)
@@ -4699,6 +4865,8 @@ do
         H.TargetJobId = nil
         H.StartCounted = false
         H.QueuePrepared = false
+        H.IgnoreTeleportStateFailedUntil = 0
+        H.ResetBatch()
         task.spawn(H.Perform)
         return true
     end
@@ -4723,8 +4891,48 @@ do
 
             if saveSettings then pcall(saveSettings) end
         elseif teleportState == Enum.TeleportState.Failed then
-            H.Fail("Roblox reported TeleportState.Failed")
+            -- TeleportInitFailed / ErrorMessageChanged may already have handled a
+            -- GameFull (772) and queued the next same-page target. Ignore that
+            -- duplicate state event briefly so it cannot fail the new Job ID.
+            if tick() >= (H.IgnoreTeleportStateFailedUntil or 0) then
+                H.HandleFailure("Roblox reported TeleportState.Failed", false, false)
+            end
         end
+    end
+
+    _G.ScoopHubTeleportInitFailedHandler = function(player, teleportResult, errorMessage, placeId, teleportOptions)
+        if player ~= LocalPlayer or not serverHopInProgress or not H.TargetJobId then return end
+
+        local isFull = H.IsServerFullFailure(teleportResult, errorMessage)
+        local reason = tostring(teleportResult or "TeleportInitFailed")
+            .. (tostring(errorMessage or "") ~= "" and (": " .. tostring(errorMessage)) or "")
+
+        if isFull then
+            H.LastFullFailureAt = tick()
+            Notify(
+                "Server Hop",
+                "Server is full (Error 772). Trying another Job ID from the same 100-server list...",
+                3
+            )
+            H.HandleFailure(reason, true, true)
+        else
+            H.HandleFailure(reason, false, false)
+        end
+    end
+
+    _G.ScoopHubTeleport772Handler = function(message)
+        if not serverHopInProgress or not H.TargetJobId then return end
+        -- Avoid double-handling when both TeleportInitFailed and the Roblox error
+        -- UI report the same full-server failure.
+        if tick() - (H.LastFullFailureAt or 0) < 1.5 then return end
+
+        H.LastFullFailureAt = tick()
+        Notify(
+            "Server Hop",
+            "Server is full (Error 772). Trying another Job ID from the same 100-server list...",
+            3
+        )
+        H.HandleFailure(tostring(message or "Error 772: Server is full"), true, true)
     end
 end
 
