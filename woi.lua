@@ -183,7 +183,7 @@ local Config = {
     Logo = "rbxassetid://90541504618217",
     LogoColor = Color3.fromRGB(255, 255, 255),
     Title = "AUTO BUY PET",
-    Version = "v2",
+    Version = "v2.1",
     SubTitle = "by ScoopHub",
     HubNameColor = Color3.fromRGB(242, 92, 101),
     SubTitleColor = Color3.fromRGB(166, 174, 187),
@@ -566,14 +566,14 @@ local function sendWebhook(title, description, color, fields, thumbnailUrl, dest
         description = description,
         color = color or 15158203,
         -- Discord renders the timestamp below this footer as "Today at 3:18 AM".
-        footer = { text = "AUTO BUY PET v2  •  discord.gg/WxgqUa9Qz" },
+        footer = { text = "AUTO BUY PET v2.1  •  discord.gg/WxgqUa9Qz" },
         timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
     }
     if fields then embed.fields = fields end
     if thumbnailUrl then embed.thumbnail = { url = thumbnailUrl } end
 
     local body = HttpService:JSONEncode({
-        username = "ScoopHub | AUTO BUY PET v2",
+        username = "ScoopHub | AUTO BUY PET v2.1",
         embeds = { embed },
     })
 
@@ -2916,6 +2916,9 @@ do
     C.RefreshIntentFile = C.Folder .. "/refresh_" .. tostring(LocalPlayer.UserId) .. ".json"
     C.ExhaustedBatchIds = {}
     C.LastBatchId = nil
+    C.MemoryNextPageCursor = nil
+    C.MemoryRequestedCursor = nil
+    C.MemoryBatchExhausted = false
 
     function C.Debug(message)
         local line = string.format("[%s] %s", os.date("%Y-%m-%d %H:%M:%S"), tostring(message or ""))
@@ -3401,6 +3404,7 @@ do
             data = servers,
             nextPageCursor = data.nextPageCursor,
             previousPageCursor = data.previousPageCursor,
+            _ScoopHubRequestedCursor = data.requestedCursor,
             _ScoopHubBatchId = tostring(data.batchId),
             _ScoopHubCacheAge = age,
             _ScoopHubFromSharedCache = true,
@@ -3420,11 +3424,12 @@ do
         )
 
         local data = {
-            version = 11,
+            version = 13,
             placeId = game.PlaceId,
             batchId = batchId,
             createdAt = os.time(),
             createdByUserId = LocalPlayer.UserId,
+            requestedCursor = page._ScoopHubRequestedCursor,
             nextPageCursor = page.nextPageCursor,
             previousPageCursor = page.previousPageCursor,
             servers = page.data,
@@ -3501,6 +3506,9 @@ do
         batchId = tostring(batchId or "")
         if batchId ~= "" then
             C.ExhaustedBatchIds[batchId] = true
+            if batchId:find("memory_", 1, true) == 1 then
+                C.MemoryBatchExhausted = true
+            end
             C.Debug("SHARED_BATCH exhausted locally batchId=" .. batchId)
         end
     end
@@ -3600,13 +3608,42 @@ do
         return ours, winnerUserId
     end
 
+    function C.BuildServerPageUrl(baseUrl, cursor)
+        cursor = tostring(cursor or "")
+        if cursor == "" then
+            return baseUrl
+        end
+
+        local encodedCursor = cursor
+        pcall(function()
+            encodedCursor = HttpService:UrlEncode(cursor)
+        end)
+
+        return baseUrl .. "&cursor=" .. encodedCursor
+    end
+
     function C.GetSharedServerPage(url)
         -- Executors whose file APIs are not shared keep V10's one-request
         -- behavior. When shared storage is available, prefer the shared cache.
         if not C.SharedSupported then
-            local page, err = C.FetchServerPage(url)
+            local memoryCursor = nil
+
+            if C.MemoryBatchExhausted then
+                memoryCursor = C.MemoryNextPageCursor
+                -- nil cursor after exhaustion means wrap to page 1.
+            else
+                memoryCursor = C.MemoryRequestedCursor
+            end
+
+            local memoryUrl = C.BuildServerPageUrl(url, memoryCursor)
+            local page, err = C.FetchServerPage(memoryUrl)
             if page then
+                C.MemoryRequestedCursor = memoryCursor
+                C.MemoryNextPageCursor = page.nextPageCursor
+                C.MemoryBatchExhausted = false
+                page._ScoopHubRequestedCursor = memoryCursor
                 page._ScoopHubBatchId = "memory_" .. tostring(LocalPlayer.UserId)
+                    .. "_" .. tostring(C.ServerFetchSerial)
             end
             return page, err
         end
@@ -3615,6 +3652,35 @@ do
         local cachedBatchId = cachedPage and tostring(cachedPage._ScoopHubBatchId or "") or ""
         local cacheExhausted = cachedBatchId ~= ""
             and C.ExhaustedBatchIds[cachedBatchId] == true
+        local cacheHasNoUsableServers = cachedPage ~= nil and #cachedPage.data == 0
+
+        -- V13 cursor rotation:
+        -- * Exhausted current 100-server batch -> request nextPageCursor.
+        -- * Shared cache has zero remaining globally-usable JobIds -> nextPageCursor.
+        -- * If nextPageCursor is nil, wrap to page 1.
+        -- * A normal TTL refresh does NOT advance pages; it refreshes the same
+        --   requested page so age alone cannot burn through the cursor chain.
+        local shouldAdvanceCursor = cachedPage ~= nil
+            and (cacheExhausted or cacheHasNoUsableServers)
+
+        local refreshCursor = nil
+        local refreshReason = "page1"
+        if shouldAdvanceCursor then
+            refreshCursor = cachedPage.nextPageCursor
+            if refreshCursor and tostring(refreshCursor) ~= "" then
+                refreshReason = "nextPageCursor"
+            else
+                refreshCursor = nil
+                refreshReason = "cursor-chain-end-wrap-page1"
+            end
+        elseif cachedPage and cachedPage._ScoopHubRequestedCursor then
+            -- TTL/stale refresh of an existing page: refresh that same page,
+            -- not the next one.
+            refreshCursor = cachedPage._ScoopHubRequestedCursor
+            refreshReason = "same-page-refresh"
+        end
+
+        local refreshUrl = C.BuildServerPageUrl(url, refreshCursor)
 
         if cachedPage
             and #cachedPage.data > 0
@@ -3643,6 +3709,15 @@ do
         end
 
         local oldBatchId = cachedBatchId
+
+        C.Debug(string.format(
+            "CURSOR_ROTATION refreshReason=%s oldBatchId=%s requestedCursor=%s nextCursorAvailable=%s",
+            tostring(refreshReason),
+            tostring(oldBatchId),
+            refreshCursor and "yes" or "no",
+            tostring(cachedPage ~= nil and cachedPage.nextPageCursor ~= nil)
+        ))
+
         local ownsRefresh, winnerUserId = C.AcquireRefreshOwnership()
 
         if not ownsRefresh then
@@ -3714,7 +3789,18 @@ do
             return newestPage, nil
         end
 
-        local page, fetchError = C.FetchServerPage(url)
+        local page, fetchError = C.FetchServerPage(refreshUrl)
+        if page then
+            page._ScoopHubRequestedCursor = refreshCursor
+            C.Debug(string.format(
+                "CURSOR_ROTATION FETCH_OK reason=%s requestedCursor=%s nextCursor=%s servers=%d",
+                tostring(refreshReason),
+                refreshCursor and "yes" or "page1",
+                page.nextPageCursor and "yes" or "no",
+                type(page.data) == "table" and #page.data or 0
+            ))
+        end
+
         if not page then
             local delay = tonumber(C.LastLookupRetryDelay) or 15
             C.SetSharedCooldown(delay, fetchError or "server-list request failed")
@@ -3930,7 +4016,7 @@ do
 
     C.WriteOwn()
     C.DebugLines = {}
-    C.Debug(string.format("V12 global-used JobId guard + shared persistent 100-batch start user=%s userId=%s placeId=%s jobId=%s sharedClaims=%s",
+    C.Debug(string.format("V13 cursor-rotating shared 100-batch + global-used JobId guard start user=%s userId=%s placeId=%s jobId=%s sharedClaims=%s",
         tostring(LocalPlayer.Name), tostring(LocalPlayer.UserId), tostring(game.PlaceId), tostring(game.JobId), tostring(C.SharedSupported)))
     _G.ScoopHubServerClaimHeartbeatToken = (_G.ScoopHubServerClaimHeartbeatToken or 0) + 1
     C.HeartbeatToken = _G.ScoopHubServerClaimHeartbeatToken
@@ -4702,7 +4788,7 @@ TestWebhookButton.Activated:Connect(function()
         Notify("Webhook", "Enable Webhook and add a URL first.", 2)
         return
     end
-    local sent, reason = sendWebhook("Webhook Connected", "Test alert from AUTO BUY PET v2.", 5763719)
+    local sent, reason = sendWebhook("Webhook Connected", "Test alert from AUTO BUY PET v2.1.", 5763719)
     if sent then
         Notify("Webhook", "Test alert delivered.", 2)
     else
@@ -4716,7 +4802,7 @@ TestSellWebhookButton.Activated:Connect(function()
         Notify("Sell Webhook", "Enable Sell Webhook and add a URL first.", 2)
         return
     end
-    local sent, reason = sendWebhook("Sell Webhook Connected", "Test sell-summary alert from AUTO BUY PET v2.", 15105570, nil, nil, sellWebhookUrl, true)
+    local sent, reason = sendWebhook("Sell Webhook Connected", "Test sell-summary alert from AUTO BUY PET v2.1.", 15105570, nil, nil, sellWebhookUrl, true)
     Notify("Sell Webhook", sent and "Test alert delivered." or ("Test failed: " .. tostring(reason or "request unavailable")), sent and 2 or 4)
     updateWebhookUI()
 end)
@@ -5118,7 +5204,7 @@ function startWildPetLabels()
 end
 
 -- =========================================================
--- PET PROTECT LOGIC + CENTRALIZED AUTO SERVER HOP V12
+-- PET PROTECT LOGIC + CENTRALIZED AUTO SERVER HOP V13
 -- =========================================================
 Theme.GetServerHopCandidates = function()
     local freshLow = {}
@@ -5127,7 +5213,7 @@ Theme.GetServerHopCandidates = function()
     local visitedAny = {}
     local claimed = Theme.ServerHopClaims.GetClaimed()
 
-    Theme.ServerHopClaims.Debug("=== V11 SHARED PERSISTENT 100-BATCH SEARCH START ===")
+    Theme.ServerHopClaims.Debug("=== V13 CURSOR-ROTATING SHARED 100-BATCH SEARCH START ===")
 
     -- One request, one page, up to 100 servers.  This mirrors the request
     -- pattern confirmed by the working comparison script.
@@ -5578,7 +5664,7 @@ do
             if H.CurrentRoute == "random" then
                 Theme.ServerHopClaims.MarkBatchExhausted(H.BatchId)
                 H.ScheduleRetry(
-                    "All unused Job IDs in the shared 100-server list were tried; requesting one shared refresh.",
+                    "All usable Job IDs in this shared 100-server batch were tried; advancing to the next cursor page.",
                     isServerFull and 4.0 or nil
                 )
             else
@@ -5653,7 +5739,7 @@ do
             if routeName == "random" then
                 Theme.ServerHopClaims.MarkBatchExhausted(H.BatchId)
             end
-            H.ScheduleRetry("No unique usable server was free in the shared 100-server batch.", 5.0)
+            H.ScheduleRetry("No unique usable server was free in this shared 100-server batch; advancing cursor page.", 5.0)
             return
         end
 
