@@ -163,7 +163,7 @@ local Config = {
     Logo = "rbxassetid://90541504618217",
     LogoColor = Color3.fromRGB(255, 255, 255),
     Title = "AUTO BUY PET",
-    Version = "V1.9",
+    Version = "V2",
     SubTitle = "by ScoopHub",
     HubNameColor = Color3.fromRGB(242, 92, 101),
     SubTitleColor = Color3.fromRGB(166, 174, 187),
@@ -546,14 +546,14 @@ local function sendWebhook(title, description, color, fields, thumbnailUrl, dest
         description = description,
         color = color or 15158203,
         -- Discord renders the timestamp below this footer as "Today at 3:18 AM".
-        footer = { text = "AUTO BUY PET V1.9  •  discord.gg/WxgqUa9Qz" },
+        footer = { text = "AUTO BUY PET V2  •  discord.gg/WxgqUa9Qz" },
         timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
     }
     if fields then embed.fields = fields end
     if thumbnailUrl then embed.thumbnail = { url = thumbnailUrl } end
 
     local body = HttpService:JSONEncode({
-        username = "ScoopHub | AUTO BUY PET V1.9",
+        username = "ScoopHub | AUTO BUY PET V2",
         embeds = { embed },
     })
 
@@ -2935,94 +2935,80 @@ do
         return decoded, nil
     end
 
-    function C.FetchServerPage(url, pageNumber)
+    function C.FetchServerPage(url)
+        -- V7: exactly ONE Roblox server-list request per hop attempt.
+        -- No pagination loop, no executor HTTP fallback, and no rapid retry
+        -- inside this function. If it fails, the centralized hop controller
+        -- waits before beginning a brand-new attempt.
         C.ServerFetchSerial = C.ServerFetchSerial + 1
-        if pageNumber == 1 then
-            local stagger = 0.15 + (((LocalPlayer.UserId + C.ServerFetchSerial * 13) % 17) * 0.07)
-            C.Debug(string.format("server-list cycle=%d initial stagger=%.2fs", C.ServerFetchSerial, stagger))
-            task.wait(stagger)
+        C.LastLookupRetryDelay = nil
+
+        -- Small deterministic stagger keeps many accounts from hitting Roblox
+        -- on the exact same millisecond while still keeping hops responsive.
+        local stagger = 0.10 + (((LocalPlayer.UserId + C.ServerFetchSerial * 13) % 13) * 0.06)
+        C.Debug(string.format(
+            "server-list request=%d stagger=%.2fs mode=ONE_REQUEST",
+            C.ServerFetchSerial, stagger
+        ))
+        task.wait(stagger)
+
+        local requestOk, responseBody = pcall(function()
+            return game:HttpGet(url)
+        end)
+
+        if not requestOk then
+            local errorText = tostring(responseBody or "server-list request failed")
+            local lower = string.lower(errorText)
+            if lower:find("429", 1, true) or lower:find("too many requests", 1, true) then
+                C.LastLookupRetryDelay = 20 + ((LocalPlayer.UserId + C.ServerFetchSerial) % 6)
+                C.Debug(string.format(
+                    "ONE_REQUEST FAILED rate_limited=true cooldown=%ss error=%s",
+                    tostring(C.LastLookupRetryDelay), errorText
+                ))
+                return nil, "Roblox server list is rate-limited (HTTP 429)"
+            end
+
+            C.LastLookupRetryDelay = 6 + ((LocalPlayer.UserId + C.ServerFetchSerial) % 4)
+            C.Debug(string.format(
+                "ONE_REQUEST FAILED rate_limited=false cooldown=%ss error=%s",
+                tostring(C.LastLookupRetryDelay), errorText
+            ))
+            return nil, "Roblox server-list request failed"
         end
 
-        local requestFn = (syn and syn.request)
-            or (http and http.request)
-            or http_request
-            or request
-        local backoff = { 0.8, 1.6, 2.7, 4.0 }
-        local lastError = "server-list fetch failed"
-
-        for requestAttempt = 1, 4 do
-            -- Transport 1: Roblox/game HttpGet.
-            local httpOk, httpBody = pcall(function()
-                return game:HttpGet(url)
-            end)
-            if httpOk then
-                local page, decodeError = C.DecodeServerPage(httpBody, "game:HttpGet", 200, pageNumber, requestAttempt)
-                if page then return page, nil end
-                lastError = "game:HttpGet " .. tostring(decodeError)
-            else
-                lastError = "game:HttpGet error: " .. tostring(httpBody)
-                C.Debug(string.format(
-                    "page=%s attempt=%s transport=game:HttpGet REQUEST_FAILED error=%s",
-                    tostring(pageNumber), tostring(requestAttempt), tostring(httpBody)
-                ))
-            end
-
-            -- Transport 2: executor request API. IMPORTANT: try this even when
-            -- game:HttpGet returned a string but that string was invalid JSON.
-            if type(requestFn) == "function" then
-                local fallbackOk, fallbackResponse = pcall(function()
-                    return requestFn({
-                        Url = url,
-                        Method = "GET",
-                        Headers = { ["Accept"] = "application/json" },
-                    })
-                end)
-
-                if fallbackOk then
-                    local fallbackStatus = type(fallbackResponse) == "table"
-                        and tonumber(fallbackResponse.StatusCode or fallbackResponse.Status or fallbackResponse.status_code or 200)
-                        or 200
-                    local fallbackBody = type(fallbackResponse) == "table"
-                        and (fallbackResponse.Body or fallbackResponse.body)
-                        or fallbackResponse
-
-                    if fallbackStatus and fallbackStatus >= 300 then
-                        lastError = "executor HTTP " .. tostring(fallbackStatus)
-                        C.Debug(string.format(
-                            "page=%s attempt=%s transport=executor status=%s HTTP_ERROR preview=%s",
-                            tostring(pageNumber), tostring(requestAttempt), tostring(fallbackStatus), C.BodyPreview(fallbackBody)
-                        ))
-                    else
-                        local page, decodeError = C.DecodeServerPage(
-                            fallbackBody, "executor request", fallbackStatus or "n/a", pageNumber, requestAttempt
-                        )
-                        if page then return page, nil end
-                        lastError = "executor request " .. tostring(decodeError)
-                    end
-                else
-                    lastError = "executor request error: " .. tostring(fallbackResponse)
-                    C.Debug(string.format(
-                        "page=%s attempt=%s transport=executor REQUEST_FAILED error=%s",
-                        tostring(pageNumber), tostring(requestAttempt), tostring(fallbackResponse)
-                    ))
-                end
-            else
-                C.Debug(string.format(
-                    "page=%s attempt=%s executor request API unavailable",
-                    tostring(pageNumber), tostring(requestAttempt)
-                ))
-            end
-
-            if requestAttempt < 4 then
-                local jitter = ((LocalPlayer.UserId + requestAttempt * 19 + C.ServerFetchSerial) % 8) * 0.09
-                local waitFor = backoff[requestAttempt] + jitter
-                C.Debug(string.format("page=%s attempt=%s retry backoff=%.2fs", tostring(pageNumber), tostring(requestAttempt), waitFor))
-                task.wait(waitFor)
-            end
+        if type(responseBody) ~= "string" or responseBody == "" then
+            C.LastLookupRetryDelay = 7
+            C.Debug("ONE_REQUEST INVALID_BODY body=" .. C.BodyPreview(responseBody))
+            return nil, "Roblox server list returned an empty response"
         end
 
-        C.Debug(string.format("page=%s FAILED after all transports/retries: %s", tostring(pageNumber), tostring(lastError)))
-        return nil, lastError
+        local lowerBody = string.lower(responseBody)
+        if lowerBody:find("too many requests", 1, true) or lowerBody:find('"code":429', 1, true) then
+            C.LastLookupRetryDelay = 20 + ((LocalPlayer.UserId + C.ServerFetchSerial) % 6)
+            C.Debug(string.format(
+                "ONE_REQUEST BODY_RATE_LIMIT cooldown=%ss preview=%s",
+                tostring(C.LastLookupRetryDelay), C.BodyPreview(responseBody)
+            ))
+            return nil, "Roblox server list is rate-limited (HTTP 429)"
+        end
+
+        local decodeOk, page = pcall(function()
+            return HttpService:JSONDecode(responseBody)
+        end)
+        if not decodeOk or type(page) ~= "table" or type(page.data) ~= "table" then
+            C.LastLookupRetryDelay = 7
+            C.Debug(string.format(
+                "ONE_REQUEST JSON_INVALID len=%d preview=%s",
+                #responseBody, C.BodyPreview(responseBody)
+            ))
+            return nil, "Roblox server list returned invalid data"
+        end
+
+        C.Debug(string.format(
+            "ONE_REQUEST OK servers=%d nextCursor=%s",
+            #page.data, page.nextPageCursor and "yes" or "no"
+        ))
+        return page, nil
     end
 
     function C.EnsureFolder()
@@ -3195,7 +3181,7 @@ do
 
     C.WriteOwn()
     C.DebugLines = {}
-    C.Debug(string.format("V5 diagnostic start user=%s userId=%s placeId=%s jobId=%s sharedClaims=%s",
+    C.Debug(string.format("V7 single-request start user=%s userId=%s placeId=%s jobId=%s sharedClaims=%s",
         tostring(LocalPlayer.Name), tostring(LocalPlayer.UserId), tostring(game.PlaceId), tostring(game.JobId), tostring(C.SharedSupported)))
     _G.ScoopHubServerClaimHeartbeatToken = (_G.ScoopHubServerClaimHeartbeatToken or 0) + 1
     C.HeartbeatToken = _G.ScoopHubServerClaimHeartbeatToken
@@ -3967,7 +3953,7 @@ TestWebhookButton.Activated:Connect(function()
         Notify("Webhook", "Enable Webhook and add a URL first.", 2)
         return
     end
-    local sent, reason = sendWebhook("Webhook Connected", "Test alert from AUTO BUY PET V1.9.", 5763719)
+    local sent, reason = sendWebhook("Webhook Connected", "Test alert from AUTO BUY PET V2.", 5763719)
     if sent then
         Notify("Webhook", "Test alert delivered.", 2)
     else
@@ -3981,7 +3967,7 @@ TestSellWebhookButton.Activated:Connect(function()
         Notify("Sell Webhook", "Enable Sell Webhook and add a URL first.", 2)
         return
     end
-    local sent, reason = sendWebhook("Sell Webhook Connected", "Test sell-summary alert from AUTO BUY PET V1.9.", 15105570, nil, nil, sellWebhookUrl, true)
+    local sent, reason = sendWebhook("Sell Webhook Connected", "Test sell-summary alert from AUTO BUY PET V2.", 15105570, nil, nil, sellWebhookUrl, true)
     Notify("Sell Webhook", sent and "Test alert delivered." or ("Test failed: " .. tostring(reason or "request unavailable")), sent and 2 or 4)
     updateWebhookUI()
 end)
@@ -4383,116 +4369,125 @@ function startWildPetLabels()
 end
 
 -- =========================================================
--- PET PROTECT LOGIC + CENTRALIZED AUTO SERVER HOP V4
+-- PET PROTECT LOGIC + CENTRALIZED AUTO SERVER HOP V7
 -- =========================================================
-Theme.FindLowPopulationServer = function()
+Theme.GetServerHopCandidates = function()
     local freshLow = {}
     local visitedLow = {}
     local freshAny = {}
     local visitedAny = {}
-    local cursor = nil
     local claimed = Theme.ServerHopClaims.GetClaimed()
-    local successfulPages = 0
-    local lastLookupError = nil
 
-    Theme.ServerHopClaims.Debug("=== SERVER LIST SEARCH START ===")
+    Theme.ServerHopClaims.Debug("=== V7 ONE-REQUEST SERVER SEARCH START ===")
 
-    -- V5 diagnostic fetcher: every page tries game:HttpGet first and then the
-    -- executor request API whenever HttpGet errors OR returns invalid JSON.
-    -- Each account is staggered and retries use backoff so many accounts do not
-    -- hammer the endpoint at exactly the same instant.
-    for pageNumber = 1, 8 do
-        local url = "https://games.roblox.com/v1/games/" .. game.PlaceId
-            .. "/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true"
-        if cursor then
-            url = url .. "&cursor=" .. HttpService:UrlEncode(cursor)
-        end
+    -- One request, one page, up to 100 servers.  This mirrors the request
+    -- pattern confirmed by the working comparison script.
+    local url = "https://games.roblox.com/v1/games/" .. game.PlaceId
+        .. "/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true"
 
-        local page, fetchError = Theme.ServerHopClaims.FetchServerPage(url, pageNumber)
-        if not page then
-            lastLookupError = fetchError or "server-list fetch failed"
-            break
-        end
-
-        successfulPages = successfulPages + 1
-        local acceptedThisPage = 0
-        local claimedThisPage = 0
-        local blockedThisPage = 0
-        local fullThisPage = 0
-
-        for _, server in ipairs(page.data or {}) do
-            local players = tonumber(server.playing) or 0
-            local maxPlayers = tonumber(server.maxPlayers) or math.huge
-            local jobId = tostring(server.id or "")
-            if jobId == "" then
-                blockedThisPage = blockedThisPage + 1
-            elseif players >= maxPlayers then
-                fullThisPage = fullThisPage + 1
-            elseif claimed[jobId] then
-                claimedThisPage = claimedThisPage + 1
-            elseif Theme.ServerHopClaims.IsBlocked(jobId, true) then
-                blockedThisPage = blockedThisPage + 1
-            elseif players >= 1 then
-                acceptedThisPage = acceptedThisPage + 1
-                local wasVisited = Theme.ServerHopClaims.VisitedJobIds[jobId] == true
-                if players <= 6 then
-                    table.insert(wasVisited and visitedLow or freshLow, server)
-                else
-                    table.insert(wasVisited and visitedAny or freshAny, server)
-                end
-            end
-        end
-
-        Theme.ServerHopClaims.Debug(string.format(
-            "page=%d parsed=%d accepted=%d claimedByOther=%d blocked=%d full=%d pools[freshLow=%d visitedLow=%d freshAny=%d visitedAny=%d]",
-            pageNumber, #(page.data or {}), acceptedThisPage, claimedThisPage, blockedThisPage, fullThisPage,
-            #freshLow, #visitedLow, #freshAny, #visitedAny
-        ))
-
-        if #freshLow >= 12 or not page.nextPageCursor then
-            break
-        end
-        cursor = page.nextPageCursor
-    end
-
-    Theme.ServerHopClaims.LastLookupError = successfulPages == 0 and lastLookupError or nil
-
-    local candidates = freshLow
-    local allowVisited = false
-    local populationLabel = "1-6 player"
-    if #candidates == 0 then
-        candidates = visitedLow
-        allowVisited = true
-        populationLabel = "1-6 player (previously visited)"
-    end
-    if #candidates == 0 then
-        candidates = freshAny
-        allowVisited = false
-        populationLabel = "non-full"
-    end
-    if #candidates == 0 then
-        candidates = visitedAny
-        allowVisited = true
-        populationLabel = "non-full (previously visited)"
-    end
-
-    if #candidates == 0 then
-        Theme.ServerHopClaims.Debug(string.format(
-            "SEARCH RESULT: no candidate. successfulPages=%d lastError=%s",
-            successfulPages, tostring(lastLookupError)
-        ))
+    local page, fetchError = Theme.ServerHopClaims.FetchServerPage(url)
+    if not page then
+        Theme.ServerHopClaims.LastLookupError = fetchError or "server-list request failed"
+        Theme.ServerHopClaims.Debug("SEARCH RESULT: fetch failed: " .. tostring(Theme.ServerHopClaims.LastLookupError))
         return nil
     end
 
-    local index = Theme.ServerHopClaims.NextSelectionIndex(#candidates)
-    local chosen = candidates[index]
-    chosen._ScoopHubAllowVisited = allowVisited
-    chosen._ScoopHubPopulationLabel = populationLabel
+    Theme.ServerHopClaims.LastLookupError = nil
+
+    local accepted = 0
+    local claimedByOther = 0
+    local blocked = 0
+    local full = 0
+
+    for _, server in ipairs(page.data or {}) do
+        local players = tonumber(server.playing) or 0
+        local maxPlayers = tonumber(server.maxPlayers) or math.huge
+        local jobId = tostring(server.id or "")
+
+        if jobId == "" then
+            blocked = blocked + 1
+        elseif players >= maxPlayers then
+            full = full + 1
+        elseif claimed[jobId] then
+            claimedByOther = claimedByOther + 1
+        elseif Theme.ServerHopClaims.IsBlocked(jobId, true) then
+            blocked = blocked + 1
+        elseif players >= 1 then
+            accepted = accepted + 1
+            local wasVisited = Theme.ServerHopClaims.VisitedJobIds[jobId] == true
+            if players <= 6 then
+                table.insert(wasVisited and visitedLow or freshLow, server)
+            else
+                table.insert(wasVisited and visitedAny or freshAny, server)
+            end
+        end
+    end
+
+    local function sortPool(pool)
+        table.sort(pool, function(a, b)
+            local ap = tonumber(a.playing) or math.huge
+            local bp = tonumber(b.playing) or math.huge
+            if ap ~= bp then return ap < bp end
+            local aping = tonumber(a.ping) or math.huge
+            local bping = tonumber(b.ping) or math.huge
+            if aping ~= bping then return aping < bping end
+            return tostring(a.id or "") < tostring(b.id or "")
+        end)
+    end
+
+    sortPool(freshLow)
+    sortPool(visitedLow)
+    sortPool(freshAny)
+    sortPool(visitedAny)
+
+    local candidates = {}
+    local function appendPool(pool, allowVisited, label)
+        if #pool == 0 then return end
+
+        -- Give each account a different starting position inside the same
+        -- server page.  Reservations still arbitrate any collision.
+        local startIndex = ((LocalPlayer.UserId + Theme.ServerHopClaims.SelectionSequence * 17) % #pool) + 1
+        for offset = 0, #pool - 1 do
+            local index = ((startIndex + offset - 1) % #pool) + 1
+            local server = pool[index]
+            server._ScoopHubAllowVisited = allowVisited
+            server._ScoopHubPopulationLabel = label
+            table.insert(candidates, server)
+        end
+    end
+
+    Theme.ServerHopClaims.SelectionSequence = Theme.ServerHopClaims.SelectionSequence + 1
+    appendPool(freshLow, false, "1-6 player")
+    appendPool(visitedLow, true, "1-6 player (previously visited)")
+    appendPool(freshAny, false, "non-full")
+    appendPool(visitedAny, true, "non-full (previously visited)")
+
     Theme.ServerHopClaims.Debug(string.format(
-        "SEARCH RESULT: selected jobId=%s players=%s/%s category=%s candidates=%d",
-        tostring(chosen.id), tostring(chosen.playing), tostring(chosen.maxPlayers), populationLabel, #candidates
+        "ONE_PAGE parsed=%d accepted=%d claimedByOther=%d blocked=%d full=%d pools[freshLow=%d visitedLow=%d freshAny=%d visitedAny=%d] candidates=%d",
+        #(page.data or {}), accepted, claimedByOther, blocked, full,
+        #freshLow, #visitedLow, #freshAny, #visitedAny, #candidates
     ))
-    return chosen
+
+    if #candidates == 0 then
+        Theme.ServerHopClaims.Debug("SEARCH RESULT: no usable candidate in this 100-server page")
+        return {}
+    end
+
+    local first = candidates[1]
+    Theme.ServerHopClaims.Debug(string.format(
+        "SEARCH RESULT: first candidate jobId=%s players=%s/%s category=%s totalCandidates=%d",
+        tostring(first.id), tostring(first.playing), tostring(first.maxPlayers),
+        tostring(first._ScoopHubPopulationLabel), #candidates
+    ))
+    return candidates
+end
+
+-- Compatibility helper for any external/debug code that still calls the old
+-- singular function name.  It performs the same single request and returns the
+-- first candidate only.
+Theme.FindLowPopulationServer = function()
+    local candidates = Theme.GetServerHopCandidates()
+    return candidates and candidates[1] or nil
 end
 
 function waitForPendingPetDelivery()
@@ -4514,9 +4509,11 @@ do
     H.QueuePrepared = false
 
     function H.RetryDelay()
-        local delays = { 1.0, 2.0, 3.0, 4.0, 4.0 }
-        local base = delays[math.min(H.RetryCount, #delays)] or 4.0
-        return base + (((LocalPlayer.UserId + H.RetryCount * 11) % 7) * 0.10)
+        -- A failed hop creates a new attempt, and therefore one new server-list
+        -- request. Keep those attempts spaced out instead of creating a request storm.
+        local delays = { 4.0, 6.0, 8.0, 10.0, 12.0 }
+        local base = delays[math.min(H.RetryCount, #delays)] or 12.0
+        return base + (((LocalPlayer.UserId + H.RetryCount * 11) % 7) * 0.15)
     end
 
     function H.Cancel(showMessage)
@@ -4532,32 +4529,43 @@ do
         if showMessage then Notify("Server Hop", tostring(showMessage), 2) end
     end
 
-    function H.ScheduleRetry(message)
+    function H.ScheduleRetry(message, delayOverride)
         if not serverHopInProgress then return end
         H.RetryCount = H.RetryCount + 1
-        local delaySeconds = H.RetryDelay()
+        local delaySeconds = tonumber(delayOverride) or H.RetryDelay()
         local token = H.CycleToken
+
         if message and message ~= "" then
-            Notify("Server Hop", tostring(message) .. " Retrying in " .. tostring(delaySeconds) .. "s...", 3)
+            Notify(
+                "Server Hop",
+                tostring(message) .. " Retrying in " .. string.format("%.1f", delaySeconds) .. "s...",
+                3
+            )
         end
+
         task.delay(delaySeconds, function()
-            if serverHopInProgress and H.CycleToken == token then H.Perform() end
+            if serverHopInProgress and H.CycleToken == token then
+                H.Perform()
+            end
         end)
     end
 
     function H.Fail(reason)
         if not serverHopInProgress or not H.TargetJobId then return end
+
         local failedJobId = H.TargetJobId
         Theme.ServerHopClaims.MarkFailed(failedJobId)
         H.TargetJobId = nil
         H.StartCounted = false
         Theme.ServerHopClaims.Clear()
+
         print("[AutoBuyPet] Teleport failed for " .. tostring(failedJobId) .. ": " .. tostring(reason or "unknown"))
         H.ScheduleRetry("Teleport failed; choosing a different server.")
     end
 
     function H.Perform()
         if not serverHopInProgress then return end
+
         if not waitForPendingPetDelivery() then
             H.Cancel("Waiting for " .. (pendingPetDeliveryName ~= "" and pendingPetDeliveryName or "the bought pet") .. " to arrive in your Backpack.")
             return
@@ -4565,51 +4573,83 @@ do
 
         local targetJobId = nil
         local routeName = "random"
-        local allowVisited = false
-        local populationLabel = "1-6 player"
-        for _ = 1, 10 do
-            targetJobId = Theme.ServerHopClaims.NextCustomJobId()
-            routeName = targetJobId and "custom" or "random"
-            allowVisited = false
-            populationLabel = "saved Job ID"
-            if not targetJobId then
-                local server = Theme.FindLowPopulationServer()
-                targetJobId = server and tostring(server.id or "") or nil
-                allowVisited = server and server._ScoopHubAllowVisited == true or false
-                populationLabel = server and tostring(server._ScoopHubPopulationLabel or "server") or "server"
+        local populationLabel = "server"
+
+        -- Custom Job IDs need no server-list HTTP request. Try the saved rotation
+        -- first, while still respecting cross-account reservations.
+        if #customJobIds > 0 then
+            for _ = 1, #customJobIds do
+                local customJobId = Theme.ServerHopClaims.NextCustomJobId()
+                if not customJobId then break end
+                if Theme.ServerHopClaims.TryReserve(customJobId, false) then
+                    targetJobId = customJobId
+                    routeName = "custom"
+                    populationLabel = "saved Job ID"
+                    break
+                end
+                task.wait(0.05)
             end
-            if not targetJobId then break end
-            if Theme.ServerHopClaims.TryReserve(targetJobId, allowVisited) then break end
-            targetJobId = nil
-            task.wait(0.08)
+        end
+
+        -- Random route: exactly ONE server-list request for this Perform() call.
+        -- If a reservation collision happens, try the next candidate from the SAME
+        -- response instead of fetching another page/request.
+        if not targetJobId then
+            local candidates = Theme.GetServerHopCandidates()
+
+            if candidates == nil then
+                local retryDelay = Theme.ServerHopClaims.LastLookupRetryDelay
+                H.ScheduleRetry(
+                    (Theme.ServerHopClaims.LastLookupError or "Server-list request failed")
+                        .. "; debug saved to " .. Theme.ServerHopClaims.DebugFile .. ".",
+                    retryDelay
+                )
+                return
+            end
+
+            for _, server in ipairs(candidates) do
+                local jobId = tostring(server.id or "")
+                local allowVisited = server._ScoopHubAllowVisited == true
+                if jobId ~= "" and Theme.ServerHopClaims.TryReserve(jobId, allowVisited) then
+                    targetJobId = jobId
+                    routeName = "random"
+                    populationLabel = tostring(server._ScoopHubPopulationLabel or "server")
+                    break
+                end
+                task.wait(0.03)
+            end
         end
 
         if not targetJobId then
-            if Theme.ServerHopClaims.LastLookupError then
-                H.ScheduleRetry(Theme.ServerHopClaims.LastLookupError .. "; debug saved to " .. Theme.ServerHopClaims.DebugFile .. ".")
-            else
-                H.ScheduleRetry("No unique non-full server is free right now.")
-            end
+            H.ScheduleRetry("No unique usable server was free in the current 100-server page.", 5.0)
             return
         end
 
         H.TargetJobId = targetJobId
         H.StartCounted = false
-        Notify("Server Hop", routeName == "custom"
-            and "Reserved a unique saved Job ID. Hopping..."
-            or ("Reserved a unique " .. populationLabel .. " server. Hopping..."), 2)
+
+        Notify(
+            "Server Hop",
+            routeName == "custom"
+                and "Reserved a unique saved Job ID. Hopping..."
+                or ("Reserved a unique " .. populationLabel .. " server. Hopping..."),
+            2
+        )
 
         if isKRNL and not H.QueuePrepared then
             enableKRNLQueue()
             H.QueuePrepared = true
         end
-        saveSettings()
-        task.wait(0.4)
 
+        saveSettings()
+        task.wait(0.35)
+
+        -- Final shared-filesystem ownership check immediately before teleport.
         if Theme.ServerHopClaims.SharedSupported then
             local stillOurs = false
             local blockedByCurrent = false
             local winnerUserId = LocalPlayer.UserId
+
             for _, claim in ipairs(Theme.ServerHopClaims.Read()) do
                 local uid = tonumber(claim.userId)
                 if uid == LocalPlayer.UserId and tostring(claim.reservedJobId or "") == targetJobId then
@@ -4622,10 +4662,13 @@ do
                     end
                 end
             end
+
             if not stillOurs or blockedByCurrent or winnerUserId ~= LocalPlayer.UserId then
                 H.TargetJobId = nil
                 Theme.ServerHopClaims.Clear()
-                H.ScheduleRetry("Another account won that Job ID reservation.")
+                -- Important: this starts a NEW attempt later. We do not make another
+                -- server-list request immediately inside the current attempt.
+                H.ScheduleRetry("Another account won that Job ID reservation.", 4.0)
                 return
             end
         end
@@ -4633,15 +4676,22 @@ do
         local success, err = pcall(function()
             TeleportService:TeleportToPlaceInstance(game.PlaceId, targetJobId, LocalPlayer)
         end)
-        if not success then H.Fail(err) end
+
+        if not success then
+            H.Fail(err)
+        end
     end
 
     function H.Begin(source)
         source = source or "manual"
+
         if serverHopInProgress then
-            if source == "manual" then Notify("Server Hop", "A server hop is already being prepared.", 2) end
+            if source == "manual" then
+                Notify("Server Hop", "A server hop is already being prepared.", 2)
+            end
             return false
         end
+
         H.CycleToken = H.CycleToken + 1
         serverHopInProgress = true
         H.Source = source
@@ -4660,13 +4710,17 @@ do
     _G.ScoopHubTeleportStateHandler = function(teleportState)
         if teleportState == Enum.TeleportState.Started then
             print("[AutoBuyPet] Teleport started - saving state...")
+
             if serverHopInProgress and H.TargetJobId and not H.StartCounted then
                 H.StartCounted = true
                 Theme.ServerHopClaims.MarkVisited(H.TargetJobId)
                 serverHops = serverHops + 1
-                if ServerHopsLabel then ServerHopsLabel.Text = formatWebhookNumber(serverHops) end
+                if ServerHopsLabel then
+                    ServerHopsLabel.Text = formatWebhookNumber(serverHops)
+                end
                 addActivity("Server hop " .. tostring(serverHops) .. " started")
             end
+
             if saveSettings then pcall(saveSettings) end
         elseif teleportState == Enum.TeleportState.Failed then
             H.Fail("Roblox reported TeleportState.Failed")
