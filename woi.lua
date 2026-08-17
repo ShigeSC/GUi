@@ -51,7 +51,7 @@ end)
 
 -- Detect KRNL and set up queue_on_teleport
 local isKRNL = typeof(queue_on_teleport) == "function"
-local SCRIPT_URL = "https://raw.githubusercontent.com/yupie1558-beep/gag2/refs/heads/main/gag2loader.lua"
+local SCRIPT_URL = "https://raw.githubusercontent.com/ShigeSC/GUi/refs/heads/main/woi.lua"
 
 -- Function to queue this script for execution after teleport
 local function setupAutoRejoinQueue()
@@ -5447,4 +5447,4 @@ end
 print("[AutoBuyPet] Loaded: " .. tostring(isKRNL) .. " | SERVER HOPPING: " .. tostring(autoRejoin))
 addActivity("Script loaded")
 Notify("Loaded", "Settings restored: " .. tostring(isKRNL), 3)
--- HEHE
+--
