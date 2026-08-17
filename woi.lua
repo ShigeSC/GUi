@@ -183,7 +183,7 @@ local Config = {
     Logo = "rbxassetid://90541504618217",
     LogoColor = Color3.fromRGB(255, 255, 255),
     Title = "AUTO BUY PET",
-    Version = "V2.1",
+    Version = "V1.9",
     SubTitle = "by ScoopHub",
     HubNameColor = Color3.fromRGB(242, 92, 101),
     SubTitleColor = Color3.fromRGB(166, 174, 187),
@@ -566,14 +566,14 @@ local function sendWebhook(title, description, color, fields, thumbnailUrl, dest
         description = description,
         color = color or 15158203,
         -- Discord renders the timestamp below this footer as "Today at 3:18 AM".
-        footer = { text = "AUTO BUY PET V2.1  •  discord.gg/WxgqUa9Qz" },
+        footer = { text = "AUTO BUY PET V1.9  •  discord.gg/WxgqUa9Qz" },
         timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
     }
     if fields then embed.fields = fields end
     if thumbnailUrl then embed.thumbnail = { url = thumbnailUrl } end
 
     local body = HttpService:JSONEncode({
-        username = "ScoopHub | AUTO BUY PET V2.1",
+        username = "ScoopHub | AUTO BUY PET V1.9",
         embeds = { embed },
     })
 
@@ -3212,7 +3212,7 @@ do
 
     C.WriteOwn()
     C.DebugLines = {}
-    C.Debug(string.format("V8 single-request + 772 same-batch failover start user=%s userId=%s placeId=%s jobId=%s sharedClaims=%s",
+    C.Debug(string.format("V9 persistent 100-batch failover start user=%s userId=%s placeId=%s jobId=%s sharedClaims=%s",
         tostring(LocalPlayer.Name), tostring(LocalPlayer.UserId), tostring(game.PlaceId), tostring(game.JobId), tostring(C.SharedSupported)))
     _G.ScoopHubServerClaimHeartbeatToken = (_G.ScoopHubServerClaimHeartbeatToken or 0) + 1
     C.HeartbeatToken = _G.ScoopHubServerClaimHeartbeatToken
@@ -3984,7 +3984,7 @@ TestWebhookButton.Activated:Connect(function()
         Notify("Webhook", "Enable Webhook and add a URL first.", 2)
         return
     end
-    local sent, reason = sendWebhook("Webhook Connected", "Test alert from AUTO BUY PET V2.1.", 5763719)
+    local sent, reason = sendWebhook("Webhook Connected", "Test alert from AUTO BUY PET V1.9.", 5763719)
     if sent then
         Notify("Webhook", "Test alert delivered.", 2)
     else
@@ -3998,7 +3998,7 @@ TestSellWebhookButton.Activated:Connect(function()
         Notify("Sell Webhook", "Enable Sell Webhook and add a URL first.", 2)
         return
     end
-    local sent, reason = sendWebhook("Sell Webhook Connected", "Test sell-summary alert from AUTO BUY PET V2.1.", 15105570, nil, nil, sellWebhookUrl, true)
+    local sent, reason = sendWebhook("Sell Webhook Connected", "Test sell-summary alert from AUTO BUY PET V1.9.", 15105570, nil, nil, sellWebhookUrl, true)
     Notify("Sell Webhook", sent and "Test alert delivered." or ("Test failed: " .. tostring(reason or "request unavailable")), sent and 2 or 4)
     updateWebhookUI()
 end)
@@ -4409,7 +4409,7 @@ Theme.GetServerHopCandidates = function()
     local visitedAny = {}
     local claimed = Theme.ServerHopClaims.GetClaimed()
 
-    Theme.ServerHopClaims.Debug("=== V8 ONE-REQUEST + SAME-BATCH FAILOVER SEARCH START ===")
+    Theme.ServerHopClaims.Debug("=== V9 ONE-REQUEST + PERSISTENT-BATCH FAILOVER SEARCH START ===")
 
     -- One request, one page, up to 100 servers.  This mirrors the request
     -- pattern confirmed by the working comparison script.
@@ -4540,6 +4540,11 @@ do
     H.QueuePrepared = false
     H.BatchCandidates = nil
     H.BatchIndex = 0
+    -- Job IDs stay physically inside BatchCandidates after failures.
+    -- This table only remembers which entries were already attempted during
+    -- the current batch so we can move forward without deleting them.
+    H.BatchAttempted = {}
+    H.TargetBatchIndex = nil
     H.CurrentRoute = nil
     H.CurrentPopulationLabel = "server"
     H.IgnoreTeleportStateFailedUntil = 0
@@ -4556,8 +4561,42 @@ do
     function H.ResetBatch()
         H.BatchCandidates = nil
         H.BatchIndex = 0
+        H.BatchAttempted = {}
+        H.TargetBatchIndex = nil
         H.CurrentRoute = nil
         H.CurrentPopulationLabel = "server"
+    end
+
+    function H.RemoveSuccessfulBatchJobId(jobId)
+        -- IMPORTANT: a Job ID is removed from the in-memory 100-server batch
+        -- ONLY after Roblox reports TeleportState.Started for that exact target.
+        -- Failed/full/unavailable Job IDs remain in BatchCandidates and are only
+        -- marked attempted for this batch.
+        if H.CurrentRoute ~= "random" or type(H.BatchCandidates) ~= "table" then
+            return false
+        end
+
+        jobId = tostring(jobId or "")
+        if jobId == "" then return false end
+
+        for index = #H.BatchCandidates, 1, -1 do
+            local server = H.BatchCandidates[index]
+            if tostring(server and server.id or "") == jobId then
+                table.remove(H.BatchCandidates, index)
+                if H.BatchIndex >= index then
+                    H.BatchIndex = math.max(0, H.BatchIndex - 1)
+                end
+                H.BatchAttempted[jobId] = nil
+                H.TargetBatchIndex = nil
+                Theme.ServerHopClaims.Debug(string.format(
+                    "BATCH DELETE ON SUCCESS jobId=%s remaining=%d",
+                    jobId, #H.BatchCandidates
+                ))
+                return true
+            end
+        end
+
+        return false
     end
 
     function H.Cancel(showMessage)
@@ -4567,6 +4606,7 @@ do
         H.Source = nil
         H.RetryCount = 0
         H.TargetJobId = nil
+        H.TargetBatchIndex = nil
         H.StartCounted = false
         H.QueuePrepared = false
         H.IgnoreTeleportStateFailedUntil = 0
@@ -4609,8 +4649,14 @@ do
             local jobId = tostring(server and server.id or "")
             local allowVisited = server and server._ScoopHubAllowVisited == true
 
-            if jobId ~= "" and Theme.ServerHopClaims.TryReserve(jobId, allowVisited) then
-                return jobId, tostring(server._ScoopHubPopulationLabel or "server")
+            -- Do not delete failed entries. We just skip anything already attempted
+            -- during this one downloaded batch and move to the next stored Job ID.
+            if jobId ~= "" and not H.BatchAttempted[jobId] then
+                if Theme.ServerHopClaims.TryReserve(jobId, allowVisited) then
+                    H.BatchAttempted[jobId] = true
+                    H.TargetBatchIndex = H.BatchIndex
+                    return jobId, tostring(server._ScoopHubPopulationLabel or "server")
+                end
             end
             task.wait(0.03)
         end
@@ -4674,6 +4720,7 @@ do
         -- Final shared-filesystem ownership check immediately before teleport.
         if not H.FinalReservationStillOurs(targetJobId) then
             H.TargetJobId = nil
+            H.TargetBatchIndex = nil
             Theme.ServerHopClaims.Clear()
 
             if H.CurrentRoute == "random" then
@@ -4749,27 +4796,44 @@ do
 
         local failedJobId = H.TargetJobId
         H.TargetJobId = nil
+        H.TargetBatchIndex = nil
         H.StartCounted = false
         H.IgnoreTeleportStateFailedUntil = tick() + 1.75
-        Theme.ServerHopClaims.MarkFailed(failedJobId)
+
+        -- V9 rule: NEVER delete/remove the failed Job ID from the downloaded
+        -- 100-server batch. It is already marked in BatchAttempted, which is
+        -- enough to skip it for the rest of this batch. Do not call MarkFailed()
+        -- here because that would globally block/consume the Job ID before a
+        -- successful hop. Release only our cross-account reservation.
+        if H.CurrentRoute == "random" then
+            H.BatchAttempted[failedJobId] = true
+        end
         Theme.ServerHopClaims.Clear()
 
         print("[AutoBuyPet] Teleport failed for " .. tostring(failedJobId) .. ": " .. tostring(reason or "unknown"))
         Theme.ServerHopClaims.Debug(string.format(
-            "TELEPORT FAILED jobId=%s serverFull=%s reason=%s",
-            tostring(failedJobId), tostring(isServerFull == true), tostring(reason or "unknown")
+            "TELEPORT FAILED jobId=%s serverFull=%s keptInBatch=%s reason=%s",
+            tostring(failedJobId), tostring(isServerFull == true),
+            tostring(H.CurrentRoute == "random"), tostring(reason or "unknown")
         ))
 
         local token = H.CycleToken
         task.delay(isServerFull and 0.45 or 0.60, function()
             if not serverHopInProgress or H.CycleToken ~= token or H.TargetJobId then return end
 
-            if preferSameBatch and H.CurrentRoute == "random" and H.TryNextBatchCandidate(reason) then
+            -- For random hopping, ANY target-specific teleport failure first walks
+            -- the remaining Job IDs already stored in this same 100-server batch.
+            if (preferSameBatch or H.CurrentRoute == "random")
+                and H.CurrentRoute == "random"
+                and H.TryNextBatchCandidate(reason) then
                 return
             end
 
-            if isServerFull then
-                H.ScheduleRetry("All remaining servers in this 100-server list were unavailable; fetching one fresh list.", 4.0)
+            if H.CurrentRoute == "random" then
+                H.ScheduleRetry(
+                    "All unused Job IDs in this 100-server list were tried; fetching one fresh list.",
+                    isServerFull and 4.0 or nil
+                )
             else
                 H.ScheduleRetry("Teleport failed; choosing a different server.")
             end
@@ -4815,8 +4879,9 @@ do
         end
 
         -- Random route: exactly ONE server-list request for this Perform() call.
-        -- Keep the ENTIRE filtered candidate list in memory so Error 772 can move
-        -- to the next Job ID without another HTTP request.
+        -- Keep the ENTIRE filtered candidate list in memory. Failed Job IDs are
+        -- never removed from this table; they are only marked attempted. A Job ID
+        -- is deleted from the batch only after TeleportState.Started confirms success.
         if not targetJobId then
             local candidates = Theme.GetServerHopCandidates()
 
@@ -4863,6 +4928,7 @@ do
         H.Source = source
         H.RetryCount = 0
         H.TargetJobId = nil
+        H.TargetBatchIndex = nil
         H.StartCounted = false
         H.QueuePrepared = false
         H.IgnoreTeleportStateFailedUntil = 0
@@ -4881,6 +4947,9 @@ do
 
             if serverHopInProgress and H.TargetJobId and not H.StartCounted then
                 H.StartCounted = true
+                -- This is the ONLY point where a random Job ID is deleted from
+                -- the in-memory batch: Roblox has confirmed the teleport started.
+                H.RemoveSuccessfulBatchJobId(H.TargetJobId)
                 Theme.ServerHopClaims.MarkVisited(H.TargetJobId)
                 serverHops = serverHops + 1
                 if ServerHopsLabel then
@@ -4895,7 +4964,11 @@ do
             -- GameFull (772) and queued the next same-page target. Ignore that
             -- duplicate state event briefly so it cannot fail the new Job ID.
             if tick() >= (H.IgnoreTeleportStateFailedUntil or 0) then
-                H.HandleFailure("Roblox reported TeleportState.Failed", false, false)
+                H.HandleFailure(
+                    "Roblox reported TeleportState.Failed",
+                    H.CurrentRoute == "random",
+                    false
+                )
             end
         end
     end
@@ -4916,7 +4989,7 @@ do
             )
             H.HandleFailure(reason, true, true)
         else
-            H.HandleFailure(reason, false, false)
+            H.HandleFailure(reason, H.CurrentRoute == "random", false)
         end
     end
 
