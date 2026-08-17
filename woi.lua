@@ -183,7 +183,7 @@ local Config = {
     Logo = "rbxassetid://90541504618217",
     LogoColor = Color3.fromRGB(255, 255, 255),
     Title = "AUTO BUY PET",
-    Version = "V1.9",
+    Version = "V2",
     SubTitle = "by ScoopHub",
     HubNameColor = Color3.fromRGB(242, 92, 101),
     SubTitleColor = Color3.fromRGB(166, 174, 187),
@@ -566,14 +566,14 @@ local function sendWebhook(title, description, color, fields, thumbnailUrl, dest
         description = description,
         color = color or 15158203,
         -- Discord renders the timestamp below this footer as "Today at 3:18 AM".
-        footer = { text = "AUTO BUY PET V1.9  •  discord.gg/WxgqUa9Qz" },
+        footer = { text = "AUTO BUY PET V2  •  discord.gg/WxgqUa9Qz" },
         timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
     }
     if fields then embed.fields = fields end
     if thumbnailUrl then embed.thumbnail = { url = thumbnailUrl } end
 
     local body = HttpService:JSONEncode({
-        username = "ScoopHub | AUTO BUY PET V1.9",
+        username = "ScoopHub | AUTO BUY PET V2",
         embeds = { embed },
     })
 
@@ -2967,76 +2967,198 @@ do
     end
 
     function C.FetchServerPage(url)
-        -- V8: exactly ONE Roblox server-list request per fresh hop attempt.
-        -- No pagination loop, no executor HTTP fallback, and no rapid retry
-        -- inside this function. If it fails, the centralized hop controller
-        -- waits before beginning a brand-new attempt.
+        -- V10: exactly ONE network request per fresh 100-server batch.
+        -- Prefer the executor request API because it exposes StatusCode + Body.
+        -- If the executor has no request API, fall back to ONE game:HttpGet call.
+        -- There is intentionally NO second transport attempt inside this function.
         C.ServerFetchSerial = C.ServerFetchSerial + 1
         C.LastLookupRetryDelay = nil
 
-        -- Small deterministic stagger keeps many accounts from hitting Roblox
-        -- on the exact same millisecond while still keeping hops responsive.
         local stagger = 0.10 + (((LocalPlayer.UserId + C.ServerFetchSerial * 13) % 13) * 0.06)
         C.Debug(string.format(
-            "server-list request=%d stagger=%.2fs mode=ONE_REQUEST",
+            "server-list request=%d stagger=%.2fs mode=ONE_REQUEST_STATUS_AWARE",
             C.ServerFetchSerial, stagger
         ))
         task.wait(stagger)
 
+        local requestFn = request
+            or http_request
+            or (http and http.request)
+            or (syn and syn.request)
+
+        if type(requestFn) == "function" then
+            local callOk, response = pcall(function()
+                return requestFn({
+                    Url = url,
+                    Method = "GET",
+                    Headers = {
+                        ["Accept"] = "application/json",
+                    },
+                })
+            end)
+
+            if not callOk then
+                local errorText = tostring(response or "executor request failed")
+                local lowerError = string.lower(errorText)
+                if lowerError:find("429", 1, true)
+                    or lowerError:find("too many requests", 1, true) then
+                    C.LastLookupRetryDelay = 25 + ((LocalPlayer.UserId + C.ServerFetchSerial) % 11)
+                    C.Debug(string.format(
+                        "ONE_REQUEST TRANSPORT_ERROR rate_limited=true cooldown=%ss error=%s",
+                        tostring(C.LastLookupRetryDelay), errorText
+                    ))
+                    return nil, "Roblox server list is rate-limited (HTTP 429)"
+                end
+
+                C.LastLookupRetryDelay = 10 + ((LocalPlayer.UserId + C.ServerFetchSerial) % 6)
+                C.Debug(string.format(
+                    "ONE_REQUEST TRANSPORT_ERROR rate_limited=false cooldown=%ss error=%s",
+                    tostring(C.LastLookupRetryDelay), errorText
+                ))
+                return nil, "Executor server-list request failed"
+            end
+
+            local statusCode = type(response) == "table"
+                and tonumber(response.StatusCode or response.Status or response.status)
+                or nil
+            local responseBody = type(response) == "table"
+                and (response.Body or response.body or response.ResponseBody)
+                or nil
+
+            -- Honor Retry-After when the executor exposes response headers.
+            local retryAfter = nil
+            if type(response) == "table" and type(response.Headers or response.headers) == "table" then
+                local headers = response.Headers or response.headers
+                retryAfter = tonumber(
+                    headers["Retry-After"]
+                    or headers["retry-after"]
+                    or headers["retry_after"]
+                )
+            end
+
+            C.Debug(string.format(
+                "ONE_REQUEST RESPONSE transport=executor status=%s len=%s",
+                tostring(statusCode or "n/a"),
+                type(responseBody) == "string" and tostring(#responseBody) or tostring(typeof(responseBody))
+            ))
+
+            if statusCode == 429 then
+                C.LastLookupRetryDelay = math.max(
+                    tonumber(retryAfter) or 0,
+                    25 + ((LocalPlayer.UserId + C.ServerFetchSerial) % 11)
+                )
+                C.Debug(string.format(
+                    "ONE_REQUEST HTTP_429 cooldown=%ss preview=%s",
+                    tostring(C.LastLookupRetryDelay), C.BodyPreview(responseBody)
+                ))
+                return nil, "Roblox server list is rate-limited (HTTP 429)"
+            end
+
+            if statusCode and (statusCode < 200 or statusCode >= 300) then
+                C.LastLookupRetryDelay = 12 + ((LocalPlayer.UserId + C.ServerFetchSerial) % 7)
+                C.Debug(string.format(
+                    "ONE_REQUEST HTTP_ERROR status=%s cooldown=%ss preview=%s",
+                    tostring(statusCode), tostring(C.LastLookupRetryDelay), C.BodyPreview(responseBody)
+                ))
+                return nil, "Roblox server list returned HTTP " .. tostring(statusCode)
+            end
+
+            if type(responseBody) ~= "string" or responseBody == "" then
+                -- Potassium previously returned an empty HttpGet body while the
+                -- server-list endpoint was being throttled. Treat an empty 2xx/
+                -- unknown-status body conservatively instead of retrying every 7s.
+                C.LastLookupRetryDelay = 25 + ((LocalPlayer.UserId + C.ServerFetchSerial * 3) % 11)
+                C.Debug(string.format(
+                    "ONE_REQUEST EMPTY_BODY status=%s cooldown=%ss",
+                    tostring(statusCode or "n/a"), tostring(C.LastLookupRetryDelay)
+                ))
+                return nil, "Roblox server list returned an empty response"
+            end
+
+            local lowerBody = string.lower(responseBody)
+            if lowerBody:find("too many requests", 1, true)
+                or lowerBody:find('"code":429', 1, true) then
+                C.LastLookupRetryDelay = math.max(
+                    tonumber(retryAfter) or 0,
+                    25 + ((LocalPlayer.UserId + C.ServerFetchSerial) % 11)
+                )
+                C.Debug(string.format(
+                    "ONE_REQUEST BODY_RATE_LIMIT cooldown=%ss preview=%s",
+                    tostring(C.LastLookupRetryDelay), C.BodyPreview(responseBody)
+                ))
+                return nil, "Roblox server list is rate-limited (HTTP 429)"
+            end
+
+            local decodeOk, page = pcall(function()
+                return HttpService:JSONDecode(responseBody)
+            end)
+            if not decodeOk or type(page) ~= "table" or type(page.data) ~= "table" then
+                C.LastLookupRetryDelay = 12 + ((LocalPlayer.UserId + C.ServerFetchSerial) % 7)
+                C.Debug(string.format(
+                    "ONE_REQUEST JSON_INVALID status=%s len=%d preview=%s",
+                    tostring(statusCode or "n/a"), #responseBody, C.BodyPreview(responseBody)
+                ))
+                return nil, "Roblox server list returned invalid data"
+            end
+
+            C.Debug(string.format(
+                "ONE_REQUEST OK transport=executor status=%s servers=%d nextCursor=%s",
+                tostring(statusCode or "n/a"), #page.data,
+                page.nextPageCursor and "yes" or "no"
+            ))
+            return page, nil
+        end
+
+        -- Compatibility fallback for executors without request/http_request.
+        -- Still only ONE network request for this batch.
         local requestOk, responseBody = pcall(function()
             return game:HttpGet(url)
         end)
 
         if not requestOk then
             local errorText = tostring(responseBody or "server-list request failed")
-            local lower = string.lower(errorText)
-            if lower:find("429", 1, true) or lower:find("too many requests", 1, true) then
-                C.LastLookupRetryDelay = 20 + ((LocalPlayer.UserId + C.ServerFetchSerial) % 6)
+            local lowerError = string.lower(errorText)
+            if lowerError:find("429", 1, true)
+                or lowerError:find("too many requests", 1, true) then
+                C.LastLookupRetryDelay = 25 + ((LocalPlayer.UserId + C.ServerFetchSerial) % 11)
                 C.Debug(string.format(
-                    "ONE_REQUEST FAILED rate_limited=true cooldown=%ss error=%s",
+                    "ONE_REQUEST HTTPGET_ERROR rate_limited=true cooldown=%ss error=%s",
                     tostring(C.LastLookupRetryDelay), errorText
                 ))
                 return nil, "Roblox server list is rate-limited (HTTP 429)"
             end
 
-            C.LastLookupRetryDelay = 6 + ((LocalPlayer.UserId + C.ServerFetchSerial) % 4)
+            C.LastLookupRetryDelay = 10 + ((LocalPlayer.UserId + C.ServerFetchSerial) % 6)
             C.Debug(string.format(
-                "ONE_REQUEST FAILED rate_limited=false cooldown=%ss error=%s",
+                "ONE_REQUEST HTTPGET_ERROR rate_limited=false cooldown=%ss error=%s",
                 tostring(C.LastLookupRetryDelay), errorText
             ))
             return nil, "Roblox server-list request failed"
         end
 
         if type(responseBody) ~= "string" or responseBody == "" then
-            C.LastLookupRetryDelay = 7
-            C.Debug("ONE_REQUEST INVALID_BODY body=" .. C.BodyPreview(responseBody))
-            return nil, "Roblox server list returned an empty response"
-        end
-
-        local lowerBody = string.lower(responseBody)
-        if lowerBody:find("too many requests", 1, true) or lowerBody:find('"code":429', 1, true) then
-            C.LastLookupRetryDelay = 20 + ((LocalPlayer.UserId + C.ServerFetchSerial) % 6)
+            C.LastLookupRetryDelay = 25 + ((LocalPlayer.UserId + C.ServerFetchSerial * 3) % 11)
             C.Debug(string.format(
-                "ONE_REQUEST BODY_RATE_LIMIT cooldown=%ss preview=%s",
+                "ONE_REQUEST HTTPGET_EMPTY cooldown=%ss body=%s",
                 tostring(C.LastLookupRetryDelay), C.BodyPreview(responseBody)
             ))
-            return nil, "Roblox server list is rate-limited (HTTP 429)"
+            return nil, "Roblox server list returned an empty response"
         end
 
         local decodeOk, page = pcall(function()
             return HttpService:JSONDecode(responseBody)
         end)
         if not decodeOk or type(page) ~= "table" or type(page.data) ~= "table" then
-            C.LastLookupRetryDelay = 7
+            C.LastLookupRetryDelay = 12 + ((LocalPlayer.UserId + C.ServerFetchSerial) % 7)
             C.Debug(string.format(
-                "ONE_REQUEST JSON_INVALID len=%d preview=%s",
+                "ONE_REQUEST HTTPGET_JSON_INVALID len=%d preview=%s",
                 #responseBody, C.BodyPreview(responseBody)
             ))
             return nil, "Roblox server list returned invalid data"
         end
 
         C.Debug(string.format(
-            "ONE_REQUEST OK servers=%d nextCursor=%s",
+            "ONE_REQUEST OK transport=game.HttpGet servers=%d nextCursor=%s",
             #page.data, page.nextPageCursor and "yes" or "no"
         ))
         return page, nil
@@ -3212,7 +3334,7 @@ do
 
     C.WriteOwn()
     C.DebugLines = {}
-    C.Debug(string.format("V9 persistent 100-batch failover start user=%s userId=%s placeId=%s jobId=%s sharedClaims=%s",
+    C.Debug(string.format("V10 status-aware request + persistent 100-batch failover start user=%s userId=%s placeId=%s jobId=%s sharedClaims=%s",
         tostring(LocalPlayer.Name), tostring(LocalPlayer.UserId), tostring(game.PlaceId), tostring(game.JobId), tostring(C.SharedSupported)))
     _G.ScoopHubServerClaimHeartbeatToken = (_G.ScoopHubServerClaimHeartbeatToken or 0) + 1
     C.HeartbeatToken = _G.ScoopHubServerClaimHeartbeatToken
@@ -3984,7 +4106,7 @@ TestWebhookButton.Activated:Connect(function()
         Notify("Webhook", "Enable Webhook and add a URL first.", 2)
         return
     end
-    local sent, reason = sendWebhook("Webhook Connected", "Test alert from AUTO BUY PET V1.9.", 5763719)
+    local sent, reason = sendWebhook("Webhook Connected", "Test alert from AUTO BUY PET V2.", 5763719)
     if sent then
         Notify("Webhook", "Test alert delivered.", 2)
     else
@@ -3998,7 +4120,7 @@ TestSellWebhookButton.Activated:Connect(function()
         Notify("Sell Webhook", "Enable Sell Webhook and add a URL first.", 2)
         return
     end
-    local sent, reason = sendWebhook("Sell Webhook Connected", "Test sell-summary alert from AUTO BUY PET V1.9.", 15105570, nil, nil, sellWebhookUrl, true)
+    local sent, reason = sendWebhook("Sell Webhook Connected", "Test sell-summary alert from AUTO BUY PET V2.", 15105570, nil, nil, sellWebhookUrl, true)
     Notify("Sell Webhook", sent and "Test alert delivered." or ("Test failed: " .. tostring(reason or "request unavailable")), sent and 2 or 4)
     updateWebhookUI()
 end)
@@ -4400,7 +4522,7 @@ function startWildPetLabels()
 end
 
 -- =========================================================
--- PET PROTECT LOGIC + CENTRALIZED AUTO SERVER HOP V8
+-- PET PROTECT LOGIC + CENTRALIZED AUTO SERVER HOP V10
 -- =========================================================
 Theme.GetServerHopCandidates = function()
     local freshLow = {}
@@ -4409,12 +4531,12 @@ Theme.GetServerHopCandidates = function()
     local visitedAny = {}
     local claimed = Theme.ServerHopClaims.GetClaimed()
 
-    Theme.ServerHopClaims.Debug("=== V9 ONE-REQUEST + PERSISTENT-BATCH FAILOVER SEARCH START ===")
+    Theme.ServerHopClaims.Debug("=== V10 STATUS-AWARE ONE-REQUEST + PERSISTENT-BATCH SEARCH START ===")
 
     -- One request, one page, up to 100 servers.  This mirrors the request
     -- pattern confirmed by the working comparison script.
     local url = "https://games.roblox.com/v1/games/" .. game.PlaceId
-        .. "/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true"
+        .. "/servers/Public?sortOrder=Asc&limit=100"
 
     local page, fetchError = Theme.ServerHopClaims.FetchServerPage(url)
     if not page then
