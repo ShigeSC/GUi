@@ -163,7 +163,7 @@ local Config = {
     Logo = "rbxassetid://90541504618217",
     LogoColor = Color3.fromRGB(255, 255, 255),
     Title = "AUTO BUY PET",
-    Version = "V2",
+    Version = "V1.9",
     SubTitle = "by ScoopHub",
     HubNameColor = Color3.fromRGB(242, 92, 101),
     SubTitleColor = Color3.fromRGB(166, 174, 187),
@@ -546,14 +546,14 @@ local function sendWebhook(title, description, color, fields, thumbnailUrl, dest
         description = description,
         color = color or 15158203,
         -- Discord renders the timestamp below this footer as "Today at 3:18 AM".
-        footer = { text = "AUTO BUY PET V2  •  discord.gg/WxgqUa9Qz" },
+        footer = { text = "AUTO BUY PET V1.9  •  discord.gg/WxgqUa9Qz" },
         timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
     }
     if fields then embed.fields = fields end
     if thumbnailUrl then embed.thumbnail = { url = thumbnailUrl } end
 
     local body = HttpService:JSONEncode({
-        username = "ScoopHub | AUTO BUY PET V2",
+        username = "ScoopHub | AUTO BUY PET V1.9",
         embeds = { embed },
     })
 
@@ -2870,6 +2870,160 @@ do
     C.FailedJobIds = {}
     C.VisitedJobIds = { [game.JobId] = true }
     C.SelectionSequence = 0
+    C.ServerFetchSerial = 0
+    C.DebugFile = "AutoBuyPet/ServerHopDebug_" .. tostring(LocalPlayer.UserId) .. ".txt"
+    C.DebugLines = {}
+
+    function C.Debug(message)
+        local line = string.format("[%s] %s", os.date("%Y-%m-%d %H:%M:%S"), tostring(message or ""))
+        print("[AutoBuyPet][ServerHopDebug] " .. tostring(message or ""))
+        table.insert(C.DebugLines, line)
+        while #C.DebugLines > 250 do table.remove(C.DebugLines, 1) end
+        if type(writefile) == "function" then
+            pcall(function()
+                if type(isfolder) == "function" and type(makefolder) == "function" and not isfolder("AutoBuyPet") then
+                    makefolder("AutoBuyPet")
+                end
+                writefile(C.DebugFile, table.concat(C.DebugLines, "\n"))
+            end)
+        end
+    end
+
+    function C.BodyPreview(body)
+        if type(body) ~= "string" then return "<" .. typeof(body) .. ">" end
+        local preview = body:sub(1, 320):gsub("[\r\n\t]+", " ")
+        if #body > 320 then preview = preview .. "..." end
+        return preview
+    end
+
+    function C.DecodeServerPage(body, transportName, statusCode, pageNumber, attemptNumber)
+        if type(body) ~= "string" or body == "" then
+            C.Debug(string.format(
+                "page=%s attempt=%s transport=%s status=%s INVALID_BODY body=%s",
+                tostring(pageNumber), tostring(attemptNumber), tostring(transportName),
+                tostring(statusCode or "n/a"), C.BodyPreview(body)
+            ))
+            return nil, "empty/non-string response"
+        end
+
+        local decodeOk, decoded = pcall(function()
+            return HttpService:JSONDecode(body)
+        end)
+        if not decodeOk or type(decoded) ~= "table" then
+            C.Debug(string.format(
+                "page=%s attempt=%s transport=%s status=%s JSON_DECODE_FAILED len=%d preview=%s",
+                tostring(pageNumber), tostring(attemptNumber), tostring(transportName),
+                tostring(statusCode or "n/a"), #body, C.BodyPreview(body)
+            ))
+            return nil, "JSON decode failed"
+        end
+
+        if type(decoded.data) ~= "table" then
+            C.Debug(string.format(
+                "page=%s attempt=%s transport=%s status=%s WRONG_SHAPE preview=%s",
+                tostring(pageNumber), tostring(attemptNumber), tostring(transportName),
+                tostring(statusCode or "n/a"), C.BodyPreview(body)
+            ))
+            return nil, "response was JSON but not a Roblox server list"
+        end
+
+        C.Debug(string.format(
+            "page=%s attempt=%s transport=%s status=%s OK servers=%d nextCursor=%s",
+            tostring(pageNumber), tostring(attemptNumber), tostring(transportName),
+            tostring(statusCode or "n/a"), #decoded.data, decoded.nextPageCursor and "yes" or "no"
+        ))
+        return decoded, nil
+    end
+
+    function C.FetchServerPage(url, pageNumber)
+        C.ServerFetchSerial = C.ServerFetchSerial + 1
+        if pageNumber == 1 then
+            local stagger = 0.15 + (((LocalPlayer.UserId + C.ServerFetchSerial * 13) % 17) * 0.07)
+            C.Debug(string.format("server-list cycle=%d initial stagger=%.2fs", C.ServerFetchSerial, stagger))
+            task.wait(stagger)
+        end
+
+        local requestFn = (syn and syn.request)
+            or (http and http.request)
+            or http_request
+            or request
+        local backoff = { 0.8, 1.6, 2.7, 4.0 }
+        local lastError = "server-list fetch failed"
+
+        for requestAttempt = 1, 4 do
+            -- Transport 1: Roblox/game HttpGet.
+            local httpOk, httpBody = pcall(function()
+                return game:HttpGet(url)
+            end)
+            if httpOk then
+                local page, decodeError = C.DecodeServerPage(httpBody, "game:HttpGet", 200, pageNumber, requestAttempt)
+                if page then return page, nil end
+                lastError = "game:HttpGet " .. tostring(decodeError)
+            else
+                lastError = "game:HttpGet error: " .. tostring(httpBody)
+                C.Debug(string.format(
+                    "page=%s attempt=%s transport=game:HttpGet REQUEST_FAILED error=%s",
+                    tostring(pageNumber), tostring(requestAttempt), tostring(httpBody)
+                ))
+            end
+
+            -- Transport 2: executor request API. IMPORTANT: try this even when
+            -- game:HttpGet returned a string but that string was invalid JSON.
+            if type(requestFn) == "function" then
+                local fallbackOk, fallbackResponse = pcall(function()
+                    return requestFn({
+                        Url = url,
+                        Method = "GET",
+                        Headers = { ["Accept"] = "application/json" },
+                    })
+                end)
+
+                if fallbackOk then
+                    local fallbackStatus = type(fallbackResponse) == "table"
+                        and tonumber(fallbackResponse.StatusCode or fallbackResponse.Status or fallbackResponse.status_code or 200)
+                        or 200
+                    local fallbackBody = type(fallbackResponse) == "table"
+                        and (fallbackResponse.Body or fallbackResponse.body)
+                        or fallbackResponse
+
+                    if fallbackStatus and fallbackStatus >= 300 then
+                        lastError = "executor HTTP " .. tostring(fallbackStatus)
+                        C.Debug(string.format(
+                            "page=%s attempt=%s transport=executor status=%s HTTP_ERROR preview=%s",
+                            tostring(pageNumber), tostring(requestAttempt), tostring(fallbackStatus), C.BodyPreview(fallbackBody)
+                        ))
+                    else
+                        local page, decodeError = C.DecodeServerPage(
+                            fallbackBody, "executor request", fallbackStatus or "n/a", pageNumber, requestAttempt
+                        )
+                        if page then return page, nil end
+                        lastError = "executor request " .. tostring(decodeError)
+                    end
+                else
+                    lastError = "executor request error: " .. tostring(fallbackResponse)
+                    C.Debug(string.format(
+                        "page=%s attempt=%s transport=executor REQUEST_FAILED error=%s",
+                        tostring(pageNumber), tostring(requestAttempt), tostring(fallbackResponse)
+                    ))
+                end
+            else
+                C.Debug(string.format(
+                    "page=%s attempt=%s executor request API unavailable",
+                    tostring(pageNumber), tostring(requestAttempt)
+                ))
+            end
+
+            if requestAttempt < 4 then
+                local jitter = ((LocalPlayer.UserId + requestAttempt * 19 + C.ServerFetchSerial) % 8) * 0.09
+                local waitFor = backoff[requestAttempt] + jitter
+                C.Debug(string.format("page=%s attempt=%s retry backoff=%.2fs", tostring(pageNumber), tostring(requestAttempt), waitFor))
+                task.wait(waitFor)
+            end
+        end
+
+        C.Debug(string.format("page=%s FAILED after all transports/retries: %s", tostring(pageNumber), tostring(lastError)))
+        return nil, lastError
+    end
 
     function C.EnsureFolder()
         if not C.SharedSupported then return false end
@@ -3040,6 +3194,9 @@ do
     end
 
     C.WriteOwn()
+    C.DebugLines = {}
+    C.Debug(string.format("V5 diagnostic start user=%s userId=%s placeId=%s jobId=%s sharedClaims=%s",
+        tostring(LocalPlayer.Name), tostring(LocalPlayer.UserId), tostring(game.PlaceId), tostring(game.JobId), tostring(C.SharedSupported)))
     _G.ScoopHubServerClaimHeartbeatToken = (_G.ScoopHubServerClaimHeartbeatToken or 0) + 1
     C.HeartbeatToken = _G.ScoopHubServerClaimHeartbeatToken
     task.spawn(function()
@@ -3810,7 +3967,7 @@ TestWebhookButton.Activated:Connect(function()
         Notify("Webhook", "Enable Webhook and add a URL first.", 2)
         return
     end
-    local sent, reason = sendWebhook("Webhook Connected", "Test alert from AUTO BUY PET V2.", 5763719)
+    local sent, reason = sendWebhook("Webhook Connected", "Test alert from AUTO BUY PET V1.9.", 5763719)
     if sent then
         Notify("Webhook", "Test alert delivered.", 2)
     else
@@ -3824,7 +3981,7 @@ TestSellWebhookButton.Activated:Connect(function()
         Notify("Sell Webhook", "Enable Sell Webhook and add a URL first.", 2)
         return
     end
-    local sent, reason = sendWebhook("Sell Webhook Connected", "Test sell-summary alert from AUTO BUY PET V2.", 15105570, nil, nil, sellWebhookUrl, true)
+    local sent, reason = sendWebhook("Sell Webhook Connected", "Test sell-summary alert from AUTO BUY PET V1.9.", 15105570, nil, nil, sellWebhookUrl, true)
     Notify("Sell Webhook", sent and "Test alert delivered." or ("Test failed: " .. tostring(reason or "request unavailable")), sent and 2 or 4)
     updateWebhookUI()
 end)
@@ -4238,77 +4395,45 @@ Theme.FindLowPopulationServer = function()
     local successfulPages = 0
     local lastLookupError = nil
 
-    -- Roblox's server-list endpoint can fail temporarily when many accounts query
-    -- it together. Retry each page instead of treating one HTTP/JSON failure as
-    -- proof that no servers exist. Scan several pages so simultaneous accounts
-    -- have a larger pool of unique JobIds to spread across.
+    Theme.ServerHopClaims.Debug("=== SERVER LIST SEARCH START ===")
+
+    -- V5 diagnostic fetcher: every page tries game:HttpGet first and then the
+    -- executor request API whenever HttpGet errors OR returns invalid JSON.
+    -- Each account is staggered and retries use backoff so many accounts do not
+    -- hammer the endpoint at exactly the same instant.
     for pageNumber = 1, 8 do
-        local page = nil
         local url = "https://games.roblox.com/v1/games/" .. game.PlaceId
             .. "/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true"
         if cursor then
             url = url .. "&cursor=" .. HttpService:UrlEncode(cursor)
         end
 
-        for requestAttempt = 1, 3 do
-            local requestOk, responseBody = pcall(function()
-                return game:HttpGet(url)
-            end)
-
-            -- Some executors intermittently reject game:HttpGet for the Roblox
-            -- server endpoint while their request API still works. Use it as a
-            -- second transport before declaring the lookup unavailable.
-            if not requestOk or type(responseBody) ~= "string" then
-                local requestFn = (syn and syn.request)
-                    or (http and http.request)
-                    or http_request
-                    or request
-                if type(requestFn) == "function" then
-                    local fallbackOk, fallbackResponse = pcall(function()
-                        return requestFn({ Url = url, Method = "GET" })
-                    end)
-                    local fallbackStatus = fallbackOk and type(fallbackResponse) == "table"
-                        and tonumber(fallbackResponse.StatusCode or fallbackResponse.Status or 200) or 0
-                    local fallbackBody = fallbackOk and type(fallbackResponse) == "table"
-                        and (fallbackResponse.Body or fallbackResponse.body) or nil
-                    if fallbackOk and fallbackStatus < 300 and type(fallbackBody) == "string" then
-                        requestOk = true
-                        responseBody = fallbackBody
-                    end
-                end
-            end
-
-            if requestOk and type(responseBody) == "string" then
-                local decodeOk, decoded = pcall(function()
-                    return HttpService:JSONDecode(responseBody)
-                end)
-                if decodeOk and type(decoded) == "table" then
-                    page = decoded
-                    break
-                end
-                lastLookupError = "Roblox returned an unreadable server list"
-            else
-                lastLookupError = "Roblox server-list request failed"
-            end
-            if requestAttempt < 3 then
-                task.wait(0.25 * requestAttempt)
-            end
-        end
-
+        local page, fetchError = Theme.ServerHopClaims.FetchServerPage(url, pageNumber)
         if not page then
+            lastLookupError = fetchError or "server-list fetch failed"
             break
         end
 
         successfulPages = successfulPages + 1
+        local acceptedThisPage = 0
+        local claimedThisPage = 0
+        local blockedThisPage = 0
+        local fullThisPage = 0
+
         for _, server in ipairs(page.data or {}) do
             local players = tonumber(server.playing) or 0
             local maxPlayers = tonumber(server.maxPlayers) or math.huge
             local jobId = tostring(server.id or "")
-            if jobId ~= ""
-                and players >= 1
-                and players < maxPlayers
-                and not claimed[jobId]
-                and not Theme.ServerHopClaims.IsBlocked(jobId, true) then
+            if jobId == "" then
+                blockedThisPage = blockedThisPage + 1
+            elseif players >= maxPlayers then
+                fullThisPage = fullThisPage + 1
+            elseif claimed[jobId] then
+                claimedThisPage = claimedThisPage + 1
+            elseif Theme.ServerHopClaims.IsBlocked(jobId, true) then
+                blockedThisPage = blockedThisPage + 1
+            elseif players >= 1 then
+                acceptedThisPage = acceptedThisPage + 1
                 local wasVisited = Theme.ServerHopClaims.VisitedJobIds[jobId] == true
                 if players <= 6 then
                     table.insert(wasVisited and visitedLow or freshLow, server)
@@ -4318,8 +4443,12 @@ Theme.FindLowPopulationServer = function()
             end
         end
 
-        -- Once we have a healthy fresh low-population pool, there is no reason
-        -- to keep hammering the endpoint. Otherwise keep paging for fallbacks.
+        Theme.ServerHopClaims.Debug(string.format(
+            "page=%d parsed=%d accepted=%d claimedByOther=%d blocked=%d full=%d pools[freshLow=%d visitedLow=%d freshAny=%d visitedAny=%d]",
+            pageNumber, #(page.data or {}), acceptedThisPage, claimedThisPage, blockedThisPage, fullThisPage,
+            #freshLow, #visitedLow, #freshAny, #visitedAny
+        ))
+
         if #freshLow >= 12 or not page.nextPageCursor then
             break
         end
@@ -4328,10 +4457,6 @@ Theme.FindLowPopulationServer = function()
 
     Theme.ServerHopClaims.LastLookupError = successfulPages == 0 and lastLookupError or nil
 
-    -- Population is a preference, not a hard requirement. Fresh 1-6 servers are
-    -- best; if those are exhausted, reuse an old 1-6 server, then use any fresh
-    -- non-full server, and only then reuse an older non-full server. Claims, the
-    -- current JobId, and recently failed JobIds are still always excluded.
     local candidates = freshLow
     local allowVisited = false
     local populationLabel = "1-6 player"
@@ -4352,6 +4477,10 @@ Theme.FindLowPopulationServer = function()
     end
 
     if #candidates == 0 then
+        Theme.ServerHopClaims.Debug(string.format(
+            "SEARCH RESULT: no candidate. successfulPages=%d lastError=%s",
+            successfulPages, tostring(lastLookupError)
+        ))
         return nil
     end
 
@@ -4359,6 +4488,10 @@ Theme.FindLowPopulationServer = function()
     local chosen = candidates[index]
     chosen._ScoopHubAllowVisited = allowVisited
     chosen._ScoopHubPopulationLabel = populationLabel
+    Theme.ServerHopClaims.Debug(string.format(
+        "SEARCH RESULT: selected jobId=%s players=%s/%s category=%s candidates=%d",
+        tostring(chosen.id), tostring(chosen.playing), tostring(chosen.maxPlayers), populationLabel, #candidates
+    ))
     return chosen
 end
 
@@ -4381,8 +4514,9 @@ do
     H.QueuePrepared = false
 
     function H.RetryDelay()
-        local delays = { 0.8, 1.2, 1.8, 2.5, 3.0 }
-        return delays[math.min(H.RetryCount, #delays)] or 3.0
+        local delays = { 1.0, 2.0, 3.0, 4.0, 4.0 }
+        local base = delays[math.min(H.RetryCount, #delays)] or 4.0
+        return base + (((LocalPlayer.UserId + H.RetryCount * 11) % 7) * 0.10)
     end
 
     function H.Cancel(showMessage)
@@ -4452,7 +4586,7 @@ do
 
         if not targetJobId then
             if Theme.ServerHopClaims.LastLookupError then
-                H.ScheduleRetry(Theme.ServerHopClaims.LastLookupError .. "; trying the server list again.")
+                H.ScheduleRetry(Theme.ServerHopClaims.LastLookupError .. "; debug saved to " .. Theme.ServerHopClaims.DebugFile .. ".")
             else
                 H.ScheduleRetry("No unique non-full server is free right now.")
             end
@@ -4928,23 +5062,30 @@ Theme.SetPetProtectEnabled = function(enabled)
                 pendingPetDeliveryName = petName
                 local arrived = false
                 local result = "timeout"
-                for _ = 1, 120 do
-                    if not pet.Parent then
-                        if countOwnedPet(petName) > ownedBefore then
-                            arrived = true
-                            result = "arrived"
-                            break
-                        end
-                        if petRef and not isWildPetOwnedByMe(petRef) then
-                            result = "owner_changed"
-                            break
-                        end
+
+                -- A WildPet disappearing from Workspace is NOT treated as a
+                -- successful purchase by itself. Give the game a short delivery
+                -- window and confirm that our Backpack/Character pet count really
+                -- increased before anything is recorded as secured.
+                for _ = 1, 80 do
+                    if countOwnedPet(petName) > ownedBefore then
+                        arrived = true
+                        result = "arrived"
+                        break
                     end
                     task.wait(0.1)
                 end
-                if pet.Parent and not arrived then
-                    result = "still_alive"
+
+                if not arrived then
+                    if pet and pet.Parent then
+                        result = "still_alive"
+                    elseif petRef and not isWildPetOwnedByMe(petRef) then
+                        result = "owner_changed"
+                    else
+                        result = "not_in_backpack"
+                    end
                 end
+
                 pendingPetDeliveryCount = math.max(0, pendingPetDeliveryCount - 1)
                 pendingPetDelivery = pendingPetDeliveryCount > 0
                 if not pendingPetDelivery then
@@ -5039,13 +5180,32 @@ Theme.SetPetProtectEnabled = function(enabled)
                         break
                     end
                     if not pet.Parent then
-                        -- Original ScoopHub flow: once this WildPet leaves the
-                        -- server, immediately finish this target and scan for
-                        -- the next one instead of waiting in place.
+                        -- Disappearance only starts verification. Do not count,
+                        -- webhook, or report success until the matching pet is
+                        -- actually visible in our Backpack/Character.
                         fastApproach = false
                         runTarget = nil
+                        Notify("Verifying Purchase", expectedPetName .. " disappeared — checking Backpack...", 2)
+
+                        local arrived, deliveryResult = waitForPetInBackpack(
+                            pet,
+                            expectedPetName,
+                            ownedBefore,
+                            petRef
+                        )
+
                         claimedWildPets[pet] = true
-                        recordSecuredPet(pet, expectedPetName, purchasePrice, purchaseRequested, petRef)
+                        if arrived then
+                            recordSecuredPet(pet, expectedPetName, purchasePrice, purchaseRequested, petRef)
+                        else
+                            print("[AutoBuyPet] NOT secured:", expectedPetName, "delivery result:", deliveryResult)
+                            if deliveryResult == "owner_changed" then
+                                Notify("Purchase Failed", expectedPetName .. " disappeared, but ownership changed and it was not found in your Backpack.", 3)
+                            else
+                                Notify("Purchase Failed", expectedPetName .. " disappeared but was not found in your Backpack.", 3)
+                            end
+                        end
+
                         aimAtNextWildPet()
                         break
                     else
