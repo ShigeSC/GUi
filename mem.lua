@@ -51,7 +51,7 @@ end)
 
 -- Detect KRNL and set up queue_on_teleport
 local isKRNL = typeof(queue_on_teleport) == "function"
-local SCRIPT_URL = "https://raw.githubusercontent.com/ShigeSC/GUi/refs/heads/main/mem.lua"
+local SCRIPT_URL = "https://raw.githubusercontent.com/ShigeSC/GUi/refs/heads/main/men.lua"
 
 -- Function to queue this script for execution after teleport
 local function setupAutoRejoinQueue()
