@@ -5,8 +5,9 @@
     Flow:
     1. User enters a ScoopHub key.
     2. Loader validates it with ScoopHub's Cloudflare API.
-    3. Valid keys are saved locally and launch the main ScoopHub script.
-    4. Invalid, expired, revoked, or HWID-mismatched keys are rejected.
+    3. A successful validation is cached locally for 10 minutes across rejoins.
+    4. Re-execution inside that window skips the Cloudflare validation request.
+    5. Expired, revoked, or HWID-mismatched keys are still rejected on fresh validation.
 ]]
 
 repeat task.wait() until game:IsLoaded()
@@ -18,17 +19,22 @@ local ProductVersion = "V1.9"
 local HubLogo = "rbxassetid://90541504618217"
 local DiscordLogo = "rbxassetid://94434236999817"
 local DiscordInvite = "discord.gg/WxgqUa9Qz"
-local KeyUrl = "https://scoophub.pages.dev/getkey/"
-local WebsiteUrl = "https://scoophub.pages.dev/"
+local KeyUrl = "https://scoophub.me/getkey/"
+local WebsiteUrl = "https://scoophub.me/"
 local ValidateUrl = "https://scoophub-api.yupie1558.workers.dev/api/key/validate"
 
 -- Main ScoopHub script loaded ONLY after a key is accepted.
-local MainScriptUrl = "https://raw.githubusercontent.com/ShigeSC/GUi/refs/heads/main/mem.lua"
+local MainScriptUrl = ""
 -- Official provider logos. Their ImageLabels have fully transparent backgrounds.
 local LootLabsLogoAsset = "rbxassetid://102357888982176"
 local LinkvertiseLogoAsset = "rbxassetid://77886518827598"
 local SaveFolder = "ScoopHub"
 local KeyPath = SaveFolder .. "/AutoBuyPetKey.txt"
+
+-- Reuse a recent successful validation across server hops/rejoins.
+-- The absolute timestamp is stored on disk, so re-executing the loader
+-- does NOT restart this 10-minute window.
+local CACHE_TTL_SECONDS = 10 * 60
 
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
@@ -37,6 +43,7 @@ local HttpService = game:GetService("HttpService")
 local RbxAnalyticsService = game:GetService("RbxAnalyticsService")
 local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
+local CachePath = SaveFolder .. "/AutoBuyPetAuthCache_" .. tostring(LocalPlayer.UserId) .. ".json"
 
 local function safeCall(callback, ...)
     local ok, result = pcall(callback, ...)
@@ -95,7 +102,7 @@ local function getHWID()
     return ""
 end
 
-local function validateWithScoopHub(key)
+local function validateWithScoopHub(key, resolvedHWID)
     local requestFunction = getRequestFunction()
     if not requestFunction then
         return nil, "HTTP_REQUEST_UNAVAILABLE"
@@ -109,7 +116,7 @@ local function validateWithScoopHub(key)
         },
         Body = HttpService:JSONEncode({
             key = key,
-            hwid = getHWID(),
+            hwid = resolvedHWID or getHWID(),
         }),
     })
 
@@ -193,6 +200,156 @@ local function saveKey(value)
         safeCall(makefolder, SaveFolder)
     end
     safeCall(writefile, KeyPath, value)
+end
+
+local function ensureSaveFolder()
+    if not makefolder then
+        return false
+    end
+
+    if isfolder then
+        if not safeCall(isfolder, SaveFolder) then
+            safeCall(makefolder, SaveFolder)
+        end
+    else
+        safeCall(makefolder, SaveFolder)
+    end
+
+    return true
+end
+
+local function loadAuthCache()
+    if not (isfile and readfile) then
+        return nil
+    end
+
+    if not safeCall(isfile, CachePath) then
+        return nil
+    end
+
+    local raw = safeCall(readfile, CachePath)
+    if type(raw) ~= "string" or raw == "" then
+        return nil
+    end
+
+    local decoded = safeCall(function()
+        return HttpService:JSONDecode(raw)
+    end)
+
+    if type(decoded) ~= "table" then
+        return nil
+    end
+
+    return decoded
+end
+
+local function saveAuthCache(key, hwid, expiresAt)
+    -- Do not create a reusable cache when no stable device ID is available.
+    if type(hwid) ~= "string" or hwid == "" then
+        return
+    end
+
+    expiresAt = tonumber(expiresAt)
+    if not expiresAt then
+        return
+    end
+
+    if not (writefile and makefolder) then
+        return
+    end
+
+    ensureSaveFolder()
+
+    local payload = {
+        version = 1,
+        userId = LocalPlayer.UserId,
+        key = tostring(key),
+        hwid = tostring(hwid),
+        validatedAt = os.time(),
+        expiresAt = expiresAt,
+    }
+
+    local encoded = safeCall(function()
+        return HttpService:JSONEncode(payload)
+    end)
+
+    if type(encoded) == "string" and encoded ~= "" then
+        safeCall(writefile, CachePath, encoded)
+    end
+end
+
+local function clearAuthCache()
+    if isfile and safeCall(isfile, CachePath) then
+        if delfile then
+            safeCall(delfile, CachePath)
+        elseif writefile then
+            safeCall(writefile, CachePath, "{}")
+        end
+    end
+end
+
+local function clearAuthCacheForKey(key)
+    local cached = loadAuthCache()
+    if cached and tostring(cached.key or "") == tostring(key or "") then
+        clearAuthCache()
+    end
+end
+
+local function getCachedValidation(key, hwid)
+    if type(hwid) ~= "string" or hwid == "" then
+        return nil
+    end
+
+    local cached = loadAuthCache()
+    if not cached then
+        return nil
+    end
+
+    if tonumber(cached.userId) ~= tonumber(LocalPlayer.UserId) then
+        return nil
+    end
+
+    if tostring(cached.key or "") ~= tostring(key or "") then
+        return nil
+    end
+
+    if tostring(cached.hwid or "") ~= tostring(hwid) then
+        return nil
+    end
+
+    local now = os.time()
+    local validatedAt = tonumber(cached.validatedAt)
+    local expiresAt = tonumber(cached.expiresAt)
+
+    if not validatedAt or not expiresAt then
+        return nil
+    end
+
+    -- Never let a local cache keep an actually expired key alive.
+    if expiresAt <= now then
+        clearAuthCache()
+        return nil
+    end
+
+    -- A timestamp too far in the future is treated as invalid.
+    if validatedAt > now + 60 then
+        clearAuthCache()
+        return nil
+    end
+
+    local age = now - validatedAt
+    if age < 0 or age >= CACHE_TTL_SECONDS then
+        return nil
+    end
+
+    return {
+        valid = true,
+        cached = true,
+        expiresAt = expiresAt,
+        expiresIn = math.max(0, expiresAt - now),
+        cacheAge = age,
+        cacheRemaining = math.max(0, CACHE_TTL_SECONDS - age),
+    }
 end
 
 local existing = CoreGui:FindFirstChild("ScoopHubKeySystem")
@@ -689,6 +846,68 @@ KeyBox.FocusLost:Connect(function()
     })
 end)
 
+local function formatRemainingText(data)
+    local remainingText = ""
+    if tonumber(data and data.expiresIn) then
+        local seconds = math.max(0, tonumber(data.expiresIn))
+        local days = math.floor(seconds / 86400)
+        local hours = math.floor((seconds % 86400) / 3600)
+
+        if days > 0 then
+            remainingText = string.format(" (%dd %dh remaining)", days, hours)
+        elseif hours > 0 then
+            remainingText = string.format(" (%dh remaining)", hours)
+        end
+    end
+    return remainingText
+end
+
+local function resetSubmitState()
+    isChecking = false
+    SubmitButton.Text = "SUBMIT KEY  >"
+    SubmitButton.BackgroundColor3 = Color3.fromRGB(151, 27, 48)
+end
+
+local function acceptAndLoad(value, data, currentHWID, fromCache)
+    saveKey(value)
+
+    if not fromCache then
+        saveAuthCache(value, currentHWID, data and data.expiresAt)
+    end
+
+    local remainingText = formatRemainingText(data)
+
+    if fromCache then
+        local cacheLeft = math.max(0, tonumber(data.cacheRemaining or 0))
+        local cacheMinutes = math.max(1, math.ceil(cacheLeft / 60))
+        setStatus(
+            "Recent validation reused (" .. tostring(cacheMinutes) .. "m cache left)" ..
+            remainingText .. ". Loading Auto Buy Pet…",
+            Color3.fromRGB(92, 226, 171)
+        )
+        task.wait(0.10)
+    else
+        setStatus(
+            "Key accepted" .. remainingText .. ". Loading Auto Buy Pet…",
+            Color3.fromRGB(92, 226, 171)
+        )
+        task.wait(0.35)
+    end
+
+    local loaded, loadError = loadMainScript()
+    if loaded then
+        gui:Destroy()
+        return true
+    end
+
+    resetSubmitState()
+    setStatus(
+        loadError or "Key is valid, but the script could not be loaded.",
+        Color3.fromRGB(244, 91, 110)
+    )
+    return false
+end
+
 local function checkKey(value)
     if isChecking then
         return
@@ -703,15 +922,25 @@ local function checkKey(value)
     isChecking = true
     SubmitButton.Text = "CHECKING KEY..."
     SubmitButton.BackgroundColor3 = Color3.fromRGB(85, 21, 33)
-    setStatus("Contacting ScoopHub…", Color3.fromRGB(245, 199, 80))
+    setStatus("Checking ScoopHub access…", Color3.fromRGB(245, 199, 80))
 
     task.spawn(function()
-        local data, requestError = validateWithScoopHub(value)
+        local currentHWID = getHWID()
+
+        -- FIRST: try the persistent 10-minute cache.
+        -- This path performs ZERO calls to the Cloudflare validation Worker.
+        local cachedData = getCachedValidation(value, currentHWID)
+        if cachedData then
+            acceptAndLoad(value, cachedData, currentHWID, true)
+            return
+        end
+
+        -- Cache is missing/stale/different HWID: perform the normal full validation.
+        setStatus("Contacting ScoopHub…", Color3.fromRGB(245, 199, 80))
+        local data, requestError = validateWithScoopHub(value, currentHWID)
 
         if not data then
-            isChecking = false
-            SubmitButton.Text = "SUBMIT KEY  >"
-            SubmitButton.BackgroundColor3 = Color3.fromRGB(151, 27, 48)
+            resetSubmitState()
 
             local requestMessages = {
                 HTTP_REQUEST_UNAVAILABLE = "Your executor does not support HTTP requests.",
@@ -728,44 +957,13 @@ local function checkKey(value)
         end
 
         if data.valid == true then
-            saveKey(value)
-
-            local remainingText = ""
-            if tonumber(data.expiresIn) then
-                local seconds = math.max(0, tonumber(data.expiresIn))
-                local days = math.floor(seconds / 86400)
-                local hours = math.floor((seconds % 86400) / 3600)
-
-                if days > 0 then
-                    remainingText = string.format(" (%dd %dh remaining)", days, hours)
-                elseif hours > 0 then
-                    remainingText = string.format(" (%dh remaining)", hours)
-                end
-            end
-
-            setStatus(
-                "Key accepted" .. remainingText .. ". Loading Auto Buy Pet…",
-                Color3.fromRGB(92, 226, 171)
-            )
-
-            task.wait(0.35)
-
-            local loaded, loadError = loadMainScript()
-            if loaded then
-                gui:Destroy()
-                return
-            end
-
-            isChecking = false
-            SubmitButton.Text = "SUBMIT KEY  >"
-            SubmitButton.BackgroundColor3 = Color3.fromRGB(151, 27, 48)
-            setStatus(loadError or "Key is valid, but the script could not be loaded.", Color3.fromRGB(244, 91, 110))
+            acceptAndLoad(value, data, currentHWID, false)
             return
         end
 
-        isChecking = false
-        SubmitButton.Text = "SUBMIT KEY  >"
-        SubmitButton.BackgroundColor3 = Color3.fromRGB(151, 27, 48)
+        -- If the server now rejects this same key, invalidate its local cache too.
+        clearAuthCacheForKey(value)
+        resetSubmitState()
 
         local reason = tostring(data.reason or data.error or "unknown")
         local messages = {
@@ -866,3 +1064,4 @@ elseif camera and camera.ViewportSize.X < 470 then
         Scale = math.clamp(camera.ViewportSize.X / 440, 0.62, 0.92),
     }, Main)
 end
+-- new
